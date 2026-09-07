@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moleculer vs gRPC vs tRPC: an RPC protocol is not a service layer</title>
+<meta name="description" content="The same service three ways, then the same four problems against each: a second instance, a dead one, a slow one, a new one. Plus how to combine them.">
+<style>
+body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
+pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+code { font: 0.9em ui-monospace, Menlo, Consolas, monospace; }
+img { max-width: 100%; }
+blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; color: #555; }
+</style>
+</head>
+<body>
+<article>
+<h1>Moleculer vs gRPC vs tRPC: an RPC protocol is not a service layer</h1>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/08-moleculer-vs-grpc-trpc/hero.jpg" alt="Three stacked shipping boxes labelled gRPC, tRPC and MOLECULER on a warehouse shelf; the first two are small parcels, the MOLECULER one is a large crate with a packing list reading REGISTRY, BALANCER, RETRY, BREAKER, EVENTS"></p>
+<p>Ask an AI assistant &quot;how should my Node.js services talk to each other&quot; and you will get gRPC or tRPC. Both are good answers to a question — just not the same question you might be asking. gRPC and tRPC are ways to <strong>call a function on another machine</strong>. Moleculer is a <strong>service layer</strong>: it also calls functions on other machines, but it is mostly about the things around the call — finding the machine, choosing between three copies of it, giving up on a slow one, publishing &quot;this happened&quot; to whoever cares. Comparing them head-to-head is like comparing HTTP with Express. This post does it anyway, because the confusion is real, and because the honest answer is that they overlap in one place and differ everywhere else.</p>
+<p>The plan: build the same tiny <code>products</code> service three times, then throw the same three problems at each — a second instance, a dead instance, a slow instance — and watch what each tool does <em>out of the box</em>. Then the parts where Moleculer is genuinely weaker (types, other languages, browsers), the throughput shape on one box, and two setups where you use them together, which is where most real systems end up.</p>
+<p>Every snippet was executed and the output pasted. The code is in the <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/08-moleculer-vs-grpc-trpc">example repo</a>; <code>run.sh</code> reproduces everything below in about two minutes.</p>
+<blockquote>
+<p>Versions: @grpc/grpc-js 1.14.4 + @grpc/proto-loader 0.8.1, @trpc/server + @trpc/client 11.18 with zod 4.5, Moleculer 0.15.2, Node 22. Moleculer terms, glossed once: a <strong>service</strong> is an object with <strong>actions</strong> (callable functions) and <strong>events</strong> (pub/sub handlers); a <strong>broker</strong> hosts services on a <strong>node</strong> (a process) and talks to other nodes over a <strong>transporter</strong> (NATS here, plain TCP later); the <strong>registry</strong> is the broker&#39;s live list of which node has which action — the thing gRPC calls a resolver and Kubernetes calls service discovery.</p>
+</blockquote>
+<h2>What each one is</h2>
+<p><strong>gRPC</strong> is a protocol: HTTP/2 framing, Protocol Buffers for the payload, a <code>.proto</code> file as the contract, and generated (or, in Node, runtime-loaded) stubs in a dozen languages. It has <em>some</em> client-side features — deadlines, retries and load-balancing policies configured through a &quot;service config&quot; — but they are opt-in and they operate on a list of addresses someone else has to provide. Discovery, health, circuit breaking, pub/sub: not gRPC&#39;s job; that is what service meshes and xDS are for.</p>
+<p><strong>tRPC</strong> is a TypeScript library: you write a router of procedures with zod inputs, export its <em>type</em>, and a client in another TypeScript project gets full autocompletion and return types with no codegen and no schema file. On the wire it is plain HTTP + JSON (batched). It was designed for a full-stack TypeScript app — a Next.js frontend calling its own backend — and it is superb at that. It has no notion of multiple servers at all: a client has one URL.</p>
+<p><strong>Moleculer</strong> is a framework: services, actions, events, a registry, load balancing, timeouts, retries, circuit breaker, bulkhead, caching, tracing, metrics, and pluggable transport. The &quot;RPC&quot; part of it — <code>broker.call(&quot;products.get&quot;, { id: 2 })</code> — is a thin JSON-over-transporter message that the previous seven posts of this series have used. It is Node.js only, and its TypeScript story is weaker than tRPC&#39;s (post 3 is the honest version).</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/08-moleculer-vs-grpc-trpc/diagram-layers.png" alt="Layer diagram: application code on top; a service layer (registry, load balancer, timeout/retry/breaker, events, tracing); an RPC layer (contract, types, serialization); and transport at the bottom. gRPC covers the RPC layer plus a slice of the service layer; tRPC covers the RPC layer with a full types column; Moleculer covers the service and RPC layers with a thinner types column."></p>
+<p>That is the whole post in one picture. The rest is proof.</p>
+<h2>The same service, three times</h2>
+<p>Three products, <code>get</code> by id, <code>list</code> with a limit, and every response says which instance served it (<code>servedBy</code>), because that is what we will be watching.</p>
+<p><strong>gRPC</strong> — the contract lives in a <code>.proto</code> file:</p>
+<pre><code class="language-proto">syntax = &quot;proto3&quot;;
+package products;
+
+service Products {
+  rpc Get (GetRequest) returns (Product);
+  rpc List (ListRequest) returns (ProductList);
+}
+
+message GetRequest  { int32 id = 1; }
+message ListRequest { int32 limit = 1; }
+message Product     { int32 id = 1; string name = 2; double price = 3; string served_by = 4; }
+message ProductList { repeated Product items = 1; }
+</code></pre>
+<pre><code class="language-js">// grpc/server.js
+const pkg = grpc.loadPackageDefinition(
+  protoLoader.loadSync(path.join(__dirname, &quot;products.proto&quot;), { keepCase: true, longs: Number, defaults: true })
+).products;
+
+const server = new grpc.Server();
+server.addService(pkg.Products.service, {
+  Get(call, callback) {
+    const product = PRODUCTS.find((p) =&gt; p.id === call.request.id);
+    if (!product) return callback({ code: grpc.status.NOT_FOUND, message: `product ${call.request.id} not found` });
+    callback(null, { ...product, served_by: NAME });
+  },
+  List(call, callback) {
+    callback(null, { items: PRODUCTS.slice(0, call.request.limit || 10).map((p) =&gt; ({ ...p, served_by: NAME })) });
+  },
+});
+server.bindAsync(`0.0.0.0:${PORT}`, grpc.ServerCredentials.createInsecure(), () =&gt; { /* … */ });
+</code></pre>
+<p><strong>tRPC</strong> — the contract <em>is</em> the code:</p>
+<pre><code class="language-ts">// trpc/server.ts
+const t = initTRPC.create();
+
+export const appRouter = t.router({
+  products: t.router({
+    get: t.procedure
+      .input(z.object({ id: z.number().int() }))
+      .query(({ input }) =&gt; {
+        const product = PRODUCTS.find((p) =&gt; p.id === input.id);
+        if (!product) throw new TRPCError({ code: &quot;NOT_FOUND&quot;, message: `product ${input.id} not found` });
+        return { ...product, servedBy: NAME };
+      }),
+    list: t.procedure
+      .input(z.object({ limit: z.number().int().default(10) }))
+      .query(({ input }) =&gt; PRODUCTS.slice(0, input.limit).map((p) =&gt; ({ ...p, servedBy: NAME }))),
+  }),
+});
+
+// The client imports this TYPE only — no code, no schema file, no codegen.
+export type AppRouter = typeof appRouter;
+
+createHTTPServer({ router: appRouter }).listen(PORT);
+</code></pre>
+<p><strong>Moleculer</strong> — a service object; the parameter schema is a <a href="https://github.com/icebob/fastest-validator">fastest-validator</a> shorthand:</p>
+<pre><code class="language-js">// moleculer/products.service.js
+module.exports = {
+  name: &quot;products&quot;,
+  actions: {
+    get: {
+      params: { id: &quot;number|integer|convert&quot; },
+      async handler(ctx) {
+        const product = PRODUCTS.find((p) =&gt; p.id === ctx.params.id);
+        if (!product) throw new Errors.MoleculerClientError(`product ${ctx.params.id} not found`, 404, &quot;NOT_FOUND&quot;, { id: ctx.params.id });
+        return { ...product, servedBy: NAME };
+      },
+    },
+    list: {
+      params: { limit: { type: &quot;number&quot;, integer: true, default: 10 } },
+      handler(ctx) {
+        return PRODUCTS.slice(0, ctx.params.limit).map((p) =&gt; ({ ...p, servedBy: NAME }));
+      },
+    },
+  },
+};
+</code></pre>
+<pre><code class="language-js">// moleculer/node.js — a process that hosts the service
+const broker = new ServiceBroker(require(&quot;./moleculer.config.js&quot;)); // nodeID, transporter: &quot;nats://localhost:4222&quot;, …
+broker.createService(require(&quot;./products.service.js&quot;));
+broker.start();
+</code></pre>
+<p>And one call to each, hit and miss:</p>
+<pre><code>--- grpc: get 2, then get 99
+  → {&quot;id&quot;:2,&quot;name&quot;:&quot;Mouse&quot;,&quot;price&quot;:19.9,&quot;served_by&quot;:&quot;products-1&quot;}
+  → error code 5 NOT_FOUND: product 99 not found
+--- trpc: get 2, then get 99
+  → {&quot;id&quot;:2,&quot;name&quot;:&quot;Mouse&quot;,&quot;price&quot;:19.9,&quot;servedBy&quot;:&quot;products-1&quot;}
+  → error NOT_FOUND (HTTP 404): product 99 not found
+--- mol: get 2, then get 99
+  → {&quot;id&quot;:2,&quot;name&quot;:&quot;Mouse&quot;,&quot;price&quot;:19.9,&quot;servedBy&quot;:&quot;products-1&quot;}
+  → error MoleculerClientError (404 NOT_FOUND): product 99 not found
+</code></pre>
+<p>Same behaviour, three idioms. The client side is where they start to look different:</p>
+<pre><code class="language-js">// gRPC: a stub from the proto, a target address, a callback API
+const client = new pkg.Products(&quot;127.0.0.1:50051&quot;, grpc.credentials.createInsecure());
+client.Get({ id: 2 }, (err, res) =&gt; …);
+</code></pre>
+<pre><code class="language-ts">// tRPC: a typed proxy from the router type and one URL
+const client = createTRPCClient&lt;AppRouter&gt;({ links: [httpBatchLink({ url: &quot;http://127.0.0.1:4001&quot; })] });
+const p = await client.products.get.query({ id: 2 }); // p is { id: number; name: string; price: number; servedBy: string }
+</code></pre>
+<pre><code class="language-js">// Moleculer: a broker that joins the cluster; no address of anything
+const broker = new ServiceBroker({ transporter: &quot;nats://localhost:4222&quot; });
+await broker.start();
+const p = await broker.call(&quot;products.get&quot;, { id: 2 }); // p is `any` — see &quot;Type safety&quot; below
+</code></pre>
+<p>At this point tRPC is the nicest and Moleculer is the heaviest (it needs NATS running). Now the interesting part.</p>
+<h2>Problem 1: a second instance</h2>
+<p>Start <code>products-2</code> next to <code>products-1</code> for all three and make four calls.</p>
+<pre><code>--- gRPC: ipv4:127.0.0.1:50051,127.0.0.1:50052 + round_robin service config
+  call 1: served by products-1
+  call 2: served by products-1
+  call 3: served by products-2
+  call 4: served by products-1
+--- tRPC: one URL — the second server on :4002 is simply never called
+  call 1: served by products-1
+  call 2: served by products-1
+  call 3: served by products-1
+  call 4: served by products-1
+--- Moleculer: nothing configured, the registry knows both nodes
+  products.get endpoints: products-1, products-2
+  call 1: served by products-2
+  call 2: served by products-1
+  call 3: served by products-2
+  call 4: served by products-1
+</code></pre>
+<p>gRPC <em>can</em> balance, and it took this to make it do so:</p>
+<pre><code class="language-js">// grpc/client.js — a resolver that yields several addresses, plus a service config
+const serviceConfig = { loadBalancingConfig: [{ round_robin: {} }], methodConfig: [/* retry policy, later */] };
+const client = new pkg.Products(&quot;ipv4:127.0.0.1:50051,127.0.0.1:50052&quot;, grpc.credentials.createInsecure(), {
+  &quot;grpc.service_config&quot;: JSON.stringify(serviceConfig),
+});
+</code></pre>
+<p>The default policy is <code>pick_first</code>, and the addresses come from the target string — in production from DNS or xDS. Either way the client is told the list; nobody tells it when the list changes. (The first two calls both landing on <code>products-1</code> is grpc-js starting to route before the second connection was ready — round robin over <em>connected</em> subchannels.)</p>
+<p>tRPC has one URL. If you want two servers, you put a reverse proxy in front and it is the proxy that balances; tRPC does not know or care. That is not a flaw — it is the shape of the tool — but it means &quot;tRPC between microservices&quot; quietly implies &quot;plus nginx/Envoy/an ingress and a plan for how they find the instances&quot;.</p>
+<p>Moleculer&#39;s client — which is just another node — learned about both instances from the registry the moment it started, and round-robins between them (the discovery post covers the strategies). No address was written anywhere.</p>
+<h2>Problem 2: an instance dies</h2>
+<p>Stop <code>products-2</code> and call again.</p>
+<pre><code>--- gRPC: the closed connection drops out of round_robin; the static list still names it
+  call 1: served by products-1
+  call 2: served by products-1
+  call 3: served by products-1
+  call 4: served by products-1
+--- Moleculer: the node left the registry
+  products.get endpoints: products-1
+  call 1: served by products-1
+  call 2: served by products-1
+  call 3: served by products-1
+  call 4: served by products-1
+</code></pre>
+<p>Both cope. gRPC noticed the TCP connection close and stopped picking that subchannel; it will keep trying to reconnect to <code>:50052</code> in the background because the address is still on its list. Moleculer got a disconnect message from the node (a graceful stop) — for a crash it would take the heartbeat timeout, 6 s in this config — and removed it from the registry. tRPC is not in this section because one URL means there is nothing to fail over <em>to</em>.</p>
+<h2>Problem 3: an instance is slow</h2>
+<p><code>products-2</code> comes back, but every answer takes 800 ms. This is the case that separates &quot;can call a remote function&quot; from &quot;can run a system&quot;, because a slow dependency is worse than a dead one: it ties up the caller.</p>
+<p><strong>gRPC</strong> has deadlines, per call:</p>
+<pre><code class="language-js">client.Get({ id: 1 }, { deadline: Date.now() + 300 }, callback);
+</code></pre>
+<pre><code>--- gRPC: deadline 300 ms against the slow server
+  → DEADLINE_EXCEEDED after 306 ms — Deadline exceeded after 0.297s,name resolution: 0.028s,metadata filters: 0.003s,time to current attempt start: 0.001s,LB pick: 0.019s,remote_addr=127.0.0.1:50052
+</code></pre>
+<p>The deadline is propagated to the server too (the handler can check <code>call.getDeadline()</code>), which is a genuinely good design. But it is the <em>only</em> thing that happens. The round-robin client keeps sending every other call to the slow instance, and the retry policy — which we configured with <code>retryableStatusCodes: [&quot;UNAVAILABLE&quot;]</code>, the only sensible default — does not fire on <code>DEADLINE_EXCEEDED</code>, because retrying a call that took too long, with the same deadline, is usually wrong:</p>
+<pre><code>--- gRPC: round robin keeps sending every second call to the slow instance
+  call 1: served by products-2
+  call 2: served by products-2
+  call 3: served by products-1
+  call 4: served by products-2
+</code></pre>
+<p>No latency awareness, no outlier ejection, no circuit breaker. Those exist in the gRPC ecosystem — in Envoy, in xDS-driven load balancing, in a mesh — but not in the client library.</p>
+<p><strong>tRPC</strong> has neither deadlines nor retries at the protocol level; you pass an <code>AbortSignal</code> (<code>signal: AbortSignal.timeout(300)</code>) and the server keeps working on the request. Retrying is the client application&#39;s problem, and with one URL a retry goes to the same server. Fine for a browser talking to a backend behind a load balancer; not a service-to-service story.</p>
+<p><strong>Moleculer</strong> treats the slow instance as a system problem, and the config is three blocks that the resilience post explains in detail:</p>
+<pre><code class="language-js">// moleculer/moleculer.config.js
+requestTimeout: 300, // a broker-wide default; per-call override: broker.call(…, { timeout })
+retryPolicy: {
+  enabled: true, // the policy must be enabled here for a per-call `retries` to have any effect
+  retries: 0,    // …but by default we don&#39;t retry; the demo passes { retries: 1 } per call
+  delay: 100, maxDelay: 1000, factor: 2,
+  check: (err) =&gt; err &amp;&amp; !!err.retryable, // timeouts and &quot;service unavailable&quot; are; a 404 is not
+},
+circuitBreaker: {
+  enabled: true,
+  threshold: 0.5,     // open when ≥ 50 % of the calls in the window failed…
+  minRequestCount: 3, // …after at least 3 calls (default 20)
+  windowTime: 60,
+  halfOpenTime: 5000, // ms until a probe call is let through again
+  check: (err) =&gt; err &amp;&amp; err.code &gt;= 500,
+},
+</code></pre>
+<pre><code>--- plain calls, 300 ms requestTimeout, one instance is slow:
+  call 1: RequestTimeoutError after 307 ms — Request is timed out when call &#39;products.get&#39; action on &#39;products-2&#39; node. (node products-2)
+  call 2: served by products-1 in 8 ms
+  call 3: RequestTimeoutError after 302 ms — Request is timed out when call &#39;products.get&#39; action on &#39;products-2&#39; node. (node products-2)
+  call 4: served by products-1 in 6 ms
+--- same, with retries: 1 → the retry goes to another instance, and the breaker counts the timeouts:
+  call 1: served by products-1 in 409 ms
+  call 2: served by products-1 in 406 ms
+  🔴 circuit OPENED for products.get on products-2 (3/3 failed)
+  call 3: served by products-1 in 410 ms
+  call 4: served by products-1 in 5 ms
+--- the circuit is open for the slow endpoint; plain calls again:
+  call 1: served by products-1 in 6 ms
+  call 2: served by products-1 in 3 ms
+  call 3: served by products-1 in 4 ms
+  call 4: served by products-1 in 5 ms
+  endpoint state: products-2=false, products-1=true
+</code></pre>
+<p>Three stages. Plain calls: the timeout works like a gRPC deadline (and, like gRPC&#39;s, it is propagated — the callee stops too). With <code>retries: 1</code>: the retry is routed by the registry to the <em>other</em> instance, so the caller sees a slow success instead of an error, and each timeout is counted against <code>products-2</code>. After three, the breaker opens that one endpoint — the node stays in the registry, it just receives no calls until a probe succeeds 5 s later — and call 4 onwards is back to 5 ms. The <code>🔴</code> line is the <code>$circuit-breaker.opened</code> event, which any service in the cluster can subscribe to; that is how you get an alert instead of a graph that looks odd.</p>
+<p>One honest footnote, because it cost me an hour: <strong>a plain timeout with no retry does not trip the breaker.</strong> The breaker counts failures that come back from the callee; a caller-side timeout is raised outside it, so the callee&#39;s own &quot;timed out&quot; reply arrives to a request that has already been abandoned. With the retry policy enabled, the retry keeps the request alive long enough for that reply to be counted. The practical rule: if you enable <code>circuitBreaker</code>, enable <code>retryPolicy</code> too (even with <code>retries: 0</code> as the default, the mechanism is then in place for the calls that ask for it). The resilience post&#39;s <code>RETRY=1 CB=1</code> demo worked for exactly this reason, which I did not know when I wrote it.</p>
+<h2>Problem 4: a third instance appears</h2>
+<p>A deploy scaled the service up. <code>products-3</code> starts on a port the clients have never heard of.</p>
+<pre><code>--- gRPC: the client&#39;s address list is static — :50053 is never used
+  call 1: served by products-1
+  call 2: served by products-1
+  call 3: served by products-1
+  call 4: served by products-1
+--- Moleculer: a new node in the registry, no client change
+  products.get endpoints: products-1, products-3
+  call 1: served by products-3
+  call 2: served by products-1
+  call 3: served by products-3
+  call 4: served by products-1
+</code></pre>
+<p>This is the difference in one screen. gRPC did nothing wrong; it was never told. The thing that would tell it — a DNS record that updates, an xDS control plane, Kubernetes — is the infrastructure Moleculer ships in the box. Whether you want that in the box or in the platform is a legitimate architectural choice, and the Kubernetes post is about exactly that; but it is a choice you have to make, and &quot;just use gRPC&quot; hides it.</p>
+<h2>Type safety, honestly</h2>
+<p>This is where the comparison flips.</p>
+<p><strong>tRPC</strong> is the best-in-class answer. The client&#39;s <code>p.servedBy</code> above is typed because the client was created from <code>typeof appRouter</code>. Rename a field on the server and every caller fails to compile. Zero build step, zero schema, one language. If both ends are TypeScript and both ends are yours, nothing else comes close.</p>
+<p><strong>gRPC</strong> gets there with codegen — <code>protoc</code> with a TypeScript plugin, or <code>proto-loader-gen-types</code> — and the <code>.proto</code> file is a contract that other languages honour too. It is more ceremony than tRPC and less pleasant (callbacks, <code>keepCase</code> decisions, <code>int64</code> as strings), but it is the only one of the three whose types survive a language boundary.</p>
+<p><strong>Moleculer</strong> has the weakest story of the three, and there is no point pretending otherwise. <code>broker.call</code> returns <code>Promise&lt;any&gt;</code> unless you pass generics yourself — <code>broker.call&lt;Product, { id: number }&gt;(&quot;products.get&quot;, { id })</code> — and nothing checks that <code>&quot;products.get&quot;</code> exists or that the generics match what the handler returns. Parameter validation is real but runtime (fastest-validator, or zod via a custom validator), so a wrong call fails at request time with a 422, not at compile time. The community <code>moleculer-decorators</code> package and the patterns in post 3 make services pleasant to <em>write</em> in TypeScript; they do not make calls between services type-checked. If end-to-end static typing across services is the thing you value most, tRPC wins, and the last section shows how to have both.</p>
+<h2>Other languages, browsers, streaming</h2>
+<p><strong>gRPC</strong> is the polyglot option, full stop. A Go service and a Node service share the <code>.proto</code> and nothing else. It also has real streaming — server, client and bidirectional — over HTTP/2, which neither of the others matches (tRPC has subscriptions over SSE/WebSocket; Moleculer has streams for request/response and events for fan-out, not a bidirectional channel). What gRPC cannot do is talk to a browser without gRPC-Web and a proxy.</p>
+<p><strong>tRPC</strong> is the browser option. That is what it is for; <code>httpBatchLink</code> even collapses ten calls made in the same tick into one request. It does not exist outside TypeScript (there are OpenAPI bridges, with the type safety left at the door).</p>
+<p><strong>Moleculer</strong> is Node.js only — every node in the cluster is a Node process running the broker. Browsers reach it through <a href="https://github.com/moleculerjs/moleculer-web">moleculer-web</a>, an API gateway service that maps HTTP routes to actions (the NestJS post shows one). Other languages reach it by speaking the transporter protocol — there are Go and Java ports of varying completeness — or, more sensibly, through a gRPC or HTTP boundary owned by one Node service, which is the second setup below.</p>
+<h2>Throughput shape</h2>
+<p>Same box, loopback, one server instance, one client process, 2000 calls: first one at a time, then all in flight. These are not benchmarks — the sequential numbers are dominated by the client library&#39;s per-call overhead on a small VM, and a real system is never one client on loopback. Read them as shapes.</p>
+<pre><code>  gRPC unary, sequential: 2000 calls in 8677 ms (230 req/s, 4.34 ms/call)
+  gRPC unary, 2000 in flight: 1305 ms (1533 req/s)
+  tRPC over HTTP, sequential: 2000 calls in 16500 ms (121 req/s, 8.25 ms/call)
+  tRPC over HTTP, 2000 in flight (batched): 383 ms (5222 req/s)
+  tRPC over HTTP, sequential: 2000 calls in 11217 ms (178 req/s, 5.61 ms/call)   ← httpLink, no batching
+  tRPC over HTTP, 2000 in flight: 1905 ms (1050 req/s)
+  Moleculer over nats, sequential: 2000 calls in 6473 ms (309 req/s, 3.24 ms/call)
+  Moleculer over nats, 2000 in flight: 198 ms (10101 req/s)
+  Moleculer over TCP, sequential: 2000 calls in 2121 ms (943 req/s, 1.06 ms/call)
+  Moleculer over TCP, 2000 in flight: 226 ms (8850 req/s)
+</code></pre>
+<p>Three things worth taking from it. tRPC&#39;s batching is the reason its &quot;in flight&quot; number is thirteen times its sequential one: 2000 calls became 20 HTTP requests. Moleculer over NATS is the fastest of the three at concurrency because the transporter connection is one long-lived socket per node and the broker is fire-and-forget on send; over the TCP transporter (no NATS at all, nodes talk directly) it is also the fastest sequentially. And the per-call cost is a few milliseconds for all of them on this machine — the wire format is not where your latency budget goes; the slow instance in Problem 3 is.</p>
+<h2>Using them together</h2>
+<p>Most systems that ask &quot;gRPC or Moleculer&quot; end up with a service layer <em>and</em> an RPC protocol, because they solve different problems. Two setups, both running.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/08-moleculer-vs-grpc-trpc/diagram-composition.png" alt="Composition diagram: a browser calls a tRPC gateway over HTTP with end-to-end types; the gateway is a Moleculer node whose procedures call products.* on the cluster over NATS; an inventory service on the cluster wraps a gRPC client to an external Go service."></p>
+<h3>tRPC in front of a Moleculer cluster</h3>
+<p>The gateway is a Moleculer node with no services of its own, exposing a tRPC router whose procedures call the cluster. The browser gets tRPC&#39;s types; the calls get the registry, the balancer and the breaker.</p>
+<pre><code class="language-ts">// combined/gateway.ts
+const broker = new ServiceBroker({ ...(config as BrokerOptions), nodeID: &quot;trpc-gateway&quot; });
+
+type Product = { id: number; name: string; price: number; servedBy: string }; // broker.call is untyped — we declare
+
+const toTRPCError = (err: any) =&gt;
+  err?.code === 404 ? new TRPCError({ code: &quot;NOT_FOUND&quot;, message: err.message })
+  : err?.code === 504 ? new TRPCError({ code: &quot;TIMEOUT&quot;, message: err.message })
+  : new TRPCError({ code: &quot;INTERNAL_SERVER_ERROR&quot;, message: err?.message ?? String(err) });
+
+export const gatewayRouter = t.router({
+  products: t.router({
+    get: t.procedure
+      .input(z.object({ id: z.number().int() }))
+      .query(({ input }) =&gt; broker.call&lt;Product, { id: number }&gt;(&quot;products.get&quot;, input).catch((e) =&gt; { throw toTRPCError(e); })),
+    list: t.procedure
+      .input(z.object({ limit: z.number().int().default(10) }))
+      .query(({ input }) =&gt; broker.call&lt;Product[], { limit: number }&gt;(&quot;products.list&quot;, input)),
+  }),
+});
+export type GatewayRouter = typeof gatewayRouter;
+
+await broker.start();
+await broker.waitForServices(&quot;products&quot;);
+createHTTPServer({ router: gatewayRouter }).listen(4010);
+</code></pre>
+<p>The tRPC client is the one from the first section with the router type swapped:</p>
+<pre><code>[trpc-gateway] tRPC gateway on :4010, backed by products-1, products-2
+  call 1: Keyboard served by products-1
+  call 2: Keyboard served by products-2
+  call 3: Keyboard served by products-1
+  call 4: Keyboard served by products-2
+  id 99: NOT_FOUND (HTTP 404) — product 99 not found
+</code></pre>
+<p>One URL for the browser, two instances behind it, no proxy — the balancing moved from where tRPC cannot do it to where Moleculer does it by default. (moleculer-web does the same job for REST/GraphQL clients; tRPC is the choice when the consumer is your own TypeScript frontend.)</p>
+<h3>A gRPC service behind a Moleculer action</h3>
+<p>The other direction: an inventory service written in Go — stood in for by a Node gRPC server here, nothing on the Moleculer side depends on that — that the rest of the cluster should be able to call like any other action.</p>
+<pre><code class="language-js">// combined/inventory.service.js
+module.exports = {
+  name: &quot;inventory&quot;,
+  settings: { grpcAddress: process.env.INVENTORY_GRPC || &quot;127.0.0.1:50060&quot; },
+
+  actions: {
+    check: {
+      params: { sku: &quot;string&quot; },
+      handler(ctx) {
+        return new Promise((resolve, reject) =&gt; {
+          // Turn the Moleculer timeout budget into a gRPC deadline, so the remote side stops too.
+          const opts = ctx.options.timeout &gt; 0 ? { deadline: Date.now() + ctx.options.timeout } : {};
+          this.client.Check({ sku: ctx.params.sku }, opts, (err, res) =&gt;
+            err ? reject(this.mapError(err, ctx)) : resolve({ sku: res.sku, inStock: res.in_stock, warehouse: res.warehouse }));
+        });
+      },
+    },
+  },
+
+  methods: {
+    // gRPC status → Moleculer error, so callers see the same error shapes as from any other service
+    mapError(err, ctx) {
+      switch (err.code) {
+        case grpc.status.NOT_FOUND:         return new Errors.MoleculerClientError(err.details, 404, &quot;NOT_FOUND&quot;, { sku: ctx.params.sku });
+        case grpc.status.DEADLINE_EXCEEDED: return new Errors.RequestTimeoutError({ action: &quot;inventory.check (gRPC)&quot;, nodeID: this.settings.grpcAddress });
+        case grpc.status.UNAVAILABLE:       return new Errors.MoleculerRetryableError(`inventory gRPC backend unavailable: ${err.details}`, 503, &quot;UNAVAILABLE&quot;);
+        default:                            return new Errors.MoleculerError(err.details || err.message, 500, `GRPC_${grpc.status[err.code]}`);
+      }
+    },
+  },
+
+  created() { this.client = new pkg.Inventory(this.settings.grpcAddress, grpc.credentials.createInsecure()); },
+  stopped() { this.client.close(); },
+};
+</code></pre>
+<p>Any node in the cluster calls <code>inventory.check</code>; only this file knows gRPC exists. The backend answers in 200 ms in the demo:</p>
+<pre><code>  SKU-1: {&quot;sku&quot;:&quot;SKU-1&quot;,&quot;inStock&quot;:42,&quot;warehouse&quot;:&quot;WH-EU-1&quot;} (268 ms)
+  SKU-9: MoleculerClientError (404 NOT_FOUND) — unknown sku SKU-9 (217 ms)
+  SKU-1, timeout 150 ms vs a slow backend: RequestTimeoutError (504 REQUEST_TIMEOUT) — Request is timed out when call &#39;inventory.check&#39; action on &#39;inventory-1&#39; node. (153 ms)
+--- inventory-1 log:
+  WARN  INVENTORY: gRPC deadline hit for sku SKU-1 (budget was 150 ms)
+</code></pre>
+<p>The third line is the one to notice: the caller&#39;s 150 ms timeout became a 150 ms gRPC deadline, the Go side gave up at the same moment, and the wrapper logged it. The <code>UNAVAILABLE → MoleculerRetryableError</code> mapping means a restart of the Go service is retried by the cluster&#39;s retry policy, and the breaker counts real failures — the resilience layer now covers a service that was never written for it.</p>
+<h2>Which one, when</h2>
+<ul>
+<li><strong>Your frontend is TypeScript and calls your own backend</strong> — tRPC, no contest. If that backend is a cluster of services, put tRPC on the gateway node and let Moleculer do the rest, as above.</li>
+<li><strong>Services in different languages must call each other, or you need bidirectional streaming</strong> — gRPC for that boundary. Wrap it in a Moleculer service if the rest of your system is Node, so the boundary gets timeouts, retries and a breaker without every caller reimplementing them.</li>
+<li><strong>A fleet of Node.js services that need to find each other, balance, fail over and publish events — and you do not want to run a mesh to get it</strong> — that is what Moleculer is, and the RPC inside it is the least interesting part. Accept the weaker static typing, or fix it at the edges with tRPC.</li>
+<li><strong>Already on Kubernetes with a mesh doing discovery, LB and retries</strong> — gRPC is a natural fit and Moleculer&#39;s registry is redundant; you would use it for events, caching and the programming model, or not at all. (The Kubernetes post argues the other case.)</li>
+</ul>
+<p>The unhelpful framing is &quot;which RPC is fastest&quot;. Problem 3 above is what a real outage looks like, and the interesting question is how much of the answer to it your tool ships with versus how much you are about to write.</p>
+<hr>
+<p><em>Code for this post: <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/08-moleculer-vs-grpc-trpc">examples/08-vs-grpc-trpc</a> — <code>run.sh</code> reproduces every demo against a local NATS container. @grpc/grpc-js 1.14.4, @trpc/server 11.18, zod 4.5, Moleculer 0.15.2, Node 22.</em></p>
+<p><em>Previous in the series: Event-driven architecture in Node.js: pub/sub with NATS, Kafka and Redis. This is the last post of the series.</em></p>
+
+</article>
+</body>
+</html>

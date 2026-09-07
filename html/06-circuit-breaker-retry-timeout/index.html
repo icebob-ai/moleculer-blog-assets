@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Circuit breaker, retry and timeout in Node.js microservices — and why you need all three</title>
+<meta name="description" content="A dependency that is almost working is the failure mode a monolith never had. Six live demos: retry, a per-endpoint breaker that heals, timeout budgets, fallback and bulkhead.">
+<style>
+body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
+pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+code { font: 0.9em ui-monospace, Menlo, Consolas, monospace; }
+img { max-width: 100%; }
+blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; color: #555; }
+</style>
+</head>
+<body>
+<article>
+<h1>Circuit breaker, retry and timeout in Node.js microservices — and why you need all three</h1>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/06-circuit-breaker-retry-timeout/hero.jpg" alt="A breaker box labelled MOLECULER with five breakers tagged orders, users, inventory, shipping, mailer — the inventory one tripped"></p>
+<p>A microservice architecture has one failure mode that a monolith never had: a dependency that is <em>almost</em> working. Not down — down is easy, the connection is refused and you know in a millisecond. Almost working means it answers one call in three, or it answers everything but takes four seconds to do it. <code>await</code> has no opinion about that. It waits. Your request handler waits with it, the HTTP client in front of you waits, and after enough of these pile up, the service that was perfectly healthy a minute ago is now also &quot;almost working&quot;.</p>
+<p>The standard answer is three guards that every mature RPC stack has some version of: a <strong>timeout</strong> (stop waiting), a <strong>retry policy</strong> (try again when it makes sense) and a <strong>circuit breaker</strong> (stop trying when it doesn&#39;t). In Node.js you usually get these from a library you wrap around each call — <a href="https://github.com/connor4312/cockatiel">cockatiel</a>, <a href="https://github.com/nodeshift/opossum">opossum</a>, or <code>p-retry</code> plus something home-grown. In <a href="https://moleculer.services">Moleculer</a> they are broker options: one config block, applied to every service-to-service call in the cluster, with per-action overrides when one endpoint needs different rules.</p>
+<p>This post switches each of them on, one at a time, against a dependency that we break on purpose, and shows the actual output. Every snippet below was run; the logs are pasted, not typed. The runnable code is in the <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/06-circuit-breaker-retry-timeout">example repo</a> (<code>run.sh</code> reproduces every demo).</p>
+<blockquote>
+<p>If you are new to Moleculer: a <strong>service</strong> is a plain object with <strong>actions</strong> (callable functions), and a <strong>broker</strong> runs services and routes calls between nodes over a <strong>transporter</strong> (NATS here). <code>broker.call(&quot;inventory.check&quot;, params)</code> is a request/response RPC that may land in-process or on another machine. The service discovery post covers how the broker knows where <code>inventory.check</code> lives.</p>
+</blockquote>
+<h2>The setup: a dependency with knobs</h2>
+<p>Three services. <code>inventory</code> is the one we abuse — it has runtime knobs so a single <em>instance</em> can be made slow or flaky while its siblings stay healthy:</p>
+<pre><code class="language-js">// services/inventory.service.js
+const { Errors } = require(&quot;moleculer&quot;);
+
+module.exports = {
+  name: &quot;inventory&quot;,
+
+  created() {
+    this.knobs = {
+      failRate: Number(process.env.FAIL_RATE || 0),   // 0..1 — share of calls that throw
+      latency: Number(process.env.LATENCY_MS || 0),   // ms — artificial slowness
+      failEvery: Number(process.env.FAIL_EVERY || 0), // 2 = every 2nd call fails (deterministic)
+    };
+    this.calls = 0;
+  },
+
+  actions: {
+    check: {
+      params: { sku: &quot;string&quot; },
+      async handler(ctx) {
+        this.calls++;
+        const { failRate, latency, failEvery } = this.knobs;
+        if (latency) await new Promise((r) =&gt; setTimeout(r, latency));
+        const fail = (failEvery &amp;&amp; this.calls % failEvery === 0) || Math.random() &lt; failRate;
+        if (fail) {
+          // 503 + retryable: &quot;try again, it might work&quot;
+          throw new Errors.MoleculerRetryableError(&quot;inventory database unavailable&quot;, 503, &quot;DB_UNAVAILABLE&quot;);
+        }
+        return { sku: ctx.params.sku, inStock: 42, servedBy: this.broker.nodeID };
+      },
+    },
+
+    configure: {
+      params: { failRate: { type: &quot;number&quot;, optional: true }, latency: { type: &quot;number&quot;, optional: true }, failEvery: { type: &quot;number&quot;, optional: true } },
+      handler(ctx) {
+        Object.assign(this.knobs, ctx.params);
+        return this.knobs;
+      },
+    },
+  },
+};
+</code></pre>
+<p><code>orders.create</code> calls <code>inventory.check</code> and then <code>shipping.quote</code> in sequence (we need a two-hop chain for the timeout section), and <code>shipping.quote</code> can be slowed down with <code>SHIPPING_LATENCY_MS</code>. Nothing else in them is interesting.</p>
+<p>The config is shared by every node, and the three guards are switched on with environment variables so that each demo can show the same code with the feature off and then on:</p>
+<pre><code class="language-js">// moleculer.config.js
+module.exports = {
+  nodeID: process.env.NODE_NAME || `node-${process.pid}`,
+  transporter: process.env.TRANSPORTER || &quot;nats://localhost:4222&quot;,
+
+  requestTimeout: Number(process.env.REQUEST_TIMEOUT_MS || 0), // 0 = no timeout (the default!)
+
+  retryPolicy: {
+    enabled: process.env.RETRY === &quot;1&quot;,
+    retries: 3,
+    delay: 100,      // first wait; then ×factor, capped at maxDelay
+    maxDelay: 1000,
+    factor: 2,
+    check: (err) =&gt; err &amp;&amp; !!err.retryable, // only errors that say &quot;try again&quot; — never a 4xx
+  },
+
+  circuitBreaker: {
+    enabled: process.env.CB === &quot;1&quot;,
+    threshold: 0.5,        // open when ≥ 50 % of the window failed…
+    minRequestCount: 5,    // …but only after at least 5 calls (default 20)
+    windowTime: 60,        // seconds the counters are kept
+    halfOpenTime: 5 * 1000, // ms until a single probe call is let through (default 10 s)
+    check: (err) =&gt; err &amp;&amp; err.code &gt;= 500, // what counts as a failure
+  },
+
+  logger: { type: &quot;Console&quot;, options: { level: process.env.LOG_LEVEL || &quot;warn&quot;, formatter: &quot;short&quot; } },
+};
+</code></pre>
+<p>Two things in that block are worth saying out loud before we run anything. <strong>All three guards are off by default</strong>, and <code>requestTimeout</code> defaults to <code>0</code>, which means <em>no timeout at all</em>. A fresh Moleculer project will wait forever for a dead node, exactly like a fresh <code>fetch()</code> will. The framework gives you the tools; it does not guess your SLOs for you.</p>
+<p>Workers are started with the standard runner, one process per node, e.g. <code>NODE_NAME=inventory-bad FAIL_RATE=1 SERVICES=inventory SERVICEDIR=services npx moleculer-runner --config moleculer.config.js</code>. The client (<code>client.js</code>) is a broker with no services that joins the same NATS and calls <code>inventory.check</code> in a loop, printing which node answered and how long it took.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/06-circuit-breaker-retry-timeout/diagram-guards.png" alt="Where each guard sits on the path of a call"></p>
+<h2>1. Retry: try again, but only when it makes sense</h2>
+<p><code>inventory-1</code> runs with <code>FAIL_EVERY=2</code> — every second call throws the retryable 503. Ten calls, retry policy off:</p>
+<pre><code>--- no retry policy (the default)
+  ✓ inventory-1 inStock=42 (7 ms)
+  ✗ MoleculerRetryableError (503) @inventory-1: inventory database unavailable (5 ms)
+  ✓ inventory-1 inStock=42 (2 ms)
+  ✗ MoleculerRetryableError (503) @inventory-1: inventory database unavailable (2 ms)
+  ✓ inventory-1 inStock=42 (4 ms)
+  ✗ MoleculerRetryableError (503) @inventory-1: inventory database unavailable (4 ms)
+  ✓ inventory-1 inStock=42 (3 ms)
+  ✗ MoleculerRetryableError (503) @inventory-1: inventory database unavailable (4 ms)
+  ✓ inventory-1 inStock=42 (4 ms)
+  ✗ MoleculerRetryableError (503) @inventory-1: inventory database unavailable (4 ms)
+</code></pre>
+<p>Fifty percent error rate, as designed. Same workers, same client, <code>RETRY=1</code>:</p>
+<pre><code>--- RETRY=1 (retries: 3, delay: 100 ms, factor 2)
+  ✓ inventory-1 inStock=42 (28 ms)
+[21:02:08.093Z] WARN  BROKER: Retry to call &#39;inventory.check&#39; action after 100 ms... { requestID: &#39;aeba50eb-…&#39;, attempts: 1 }
+  ✓ inventory-1 inStock=42 (122 ms)
+[21:02:08.220Z] WARN  BROKER: Retry to call &#39;inventory.check&#39; action after 100 ms... { requestID: &#39;b4405bb3-…&#39;, attempts: 1 }
+  ✓ inventory-1 inStock=42 (120 ms)
+[21:02:08.337Z] WARN  BROKER: Retry to call &#39;inventory.check&#39; action after 100 ms... { requestID: &#39;533175a5-…&#39;, attempts: 1 }
+  ✓ inventory-1 inStock=42 (116 ms)
+  … (same for the remaining six)
+</code></pre>
+<p>Ten out of ten succeed. Nine of them were retried once (the first call happened to hit an odd count, after that every call&#39;s first attempt lands on an even one), each paying the 100 ms delay — visible in the timings. Nothing in the service or the client changed; the retry lives in the broker of the <em>caller</em>, which is the only place it can live, because the callee cannot retry itself.</p>
+<p>Three details that matter more than the happy path:</p>
+<p><strong>Which errors get retried is a property of the error, not of the policy.</strong> The default <code>check</code> is <code>err =&gt; err.retryable</code>. <code>MoleculerRetryableError</code> (and <code>MoleculerServerError</code>, which extends it) set that flag; the plain <code>MoleculerError</code> and every validation/4xx error do not. So a <code>ValidationError</code> is never retried no matter what you configure, and a 503 from a database that might come back is. When you throw from your own code, you decide — <code>new Errors.MoleculerRetryableError(msg, 503, &quot;DB_UNAVAILABLE&quot;)</code> versus <code>new Errors.MoleculerError(msg, 409, &quot;DUPLICATE&quot;)</code>. Think of it as the callee telling the caller whether trying again could possibly help.</p>
+<p><strong>The backoff is exponential and capped</strong>: <code>delay</code>, then <code>delay × factor</code>, then <code>× factor</code> again, never above <code>maxDelay</code>. With the values above that is 100 → 200 → 400 ms for the three retries, so a call that never succeeds costs about 700 ms of waiting on top of the attempts themselves. Set <code>maxDelay</code> with that arithmetic in mind.</p>
+<p><strong>Retries are per call, and they change which node answers.</strong> The retry goes through endpoint selection again, so with two instances of <code>inventory</code> a retry after a failure on one of them will typically land on the other. That is the failover behaviour you want — and the reason retries only make sense on <strong>idempotent</strong> actions. <code>inventory.check</code> can be run twice with no harm; <code>payments.charge</code> cannot. For those, either leave retries off for that action or make the action itself idempotent with a request key. Per-action and per-call overrides exist for exactly this:</p>
+<pre><code class="language-js">// per action — in the service schema
+actions: {
+  charge: {
+    retryPolicy: { enabled: false },
+    async handler(ctx) { /* … */ },
+  },
+}
+
+// per call — in the calling code
+await ctx.call(&quot;inventory.check&quot;, { sku }, { retries: 5 });
+</code></pre>
+<h2>2. Circuit breaker: stop asking a node that keeps saying no</h2>
+<p>Two inventory nodes now: <code>inventory-good</code> and <code>inventory-bad</code> (<code>FAIL_RATE=1</code>, fails everything). Round-robin sends every second call to the broken one, and without a breaker nothing ever changes that:</p>
+<pre><code>--- no circuit breaker: the broken node keeps getting every 2nd call
+  ✗ # 1 MoleculerRetryableError (503) @inventory-bad: inventory database unavailable (14 ms)
+  ✓ # 2 inventory-good inStock=42 (6 ms)
+  ✗ # 3 MoleculerRetryableError (503) @inventory-bad: inventory database unavailable (6 ms)
+  ✓ # 4 inventory-good inStock=42 (7 ms)
+  ✗ # 5 MoleculerRetryableError (503) @inventory-bad: inventory database unavailable (10 ms)
+  ✓ # 6 inventory-good inStock=42 (37 ms)
+  … (alternating like this for all 12)
+</code></pre>
+<p>With <code>CB=1</code> on the client. The client also registers listeners for the three <code>$circuit-breaker.*</code> events the broker broadcasts, printed as coloured dots. After the 12th call the script &quot;repairs&quot; the bad node with a targeted call (<code>broker.call(&quot;inventory.configure&quot;, { failRate: 0 }, { nodeID: &quot;inventory-bad&quot; })</code> — <code>nodeID</code> in the call options bypasses load balancing) and keeps calling every 600 ms:</p>
+<pre><code>--- CB=1: the breaker isolates inventory-bad, then we fix it and it comes back
+  ✓ # 1 inventory-good inStock=42 (11 ms)
+  ✗ # 2 MoleculerRetryableError (503) @inventory-bad: inventory database unavailable (29 ms)
+  ✓ # 3 inventory-good inStock=42 (5 ms)
+  ✗ # 4 MoleculerRetryableError (503) @inventory-bad: inventory database unavailable (12 ms)
+  ✓ # 5 inventory-good inStock=42 (6 ms)
+  ✗ # 6 MoleculerRetryableError (503) @inventory-bad: inventory database unavailable (6 ms)
+  ✓ # 7 inventory-good inStock=42 (6 ms)
+  ✗ # 8 MoleculerRetryableError (503) @inventory-bad: inventory database unavailable (5 ms)
+  ✓ # 9 inventory-good inStock=42 (9 ms)
+  🔴 circuit OPENED   for inventory.check on inventory-bad (5/5 failed)
+  ✗ #10 MoleculerRetryableError (503) @inventory-bad: inventory database unavailable (5 ms)
+  ✓ #11 inventory-good inStock=42 (7 ms)
+  ✓ #12 inventory-good inStock=42 (6 ms)
+  → inventory.configure on inventory-bad: failRate=0 (the node is &quot;fixed&quot;)
+  ✓ #13 inventory-good inStock=42 (3 ms)
+  ✓ #14 inventory-good inStock=42 (4 ms)
+  ✓ #15 inventory-good inStock=42 (5 ms)
+  ✓ #16 inventory-good inStock=42 (5 ms)
+  ✓ #17 inventory-good inStock=42 (4 ms)
+  ✓ #18 inventory-good inStock=42 (4 ms)
+  ✓ #19 inventory-good inStock=42 (5 ms)
+  ✓ #20 inventory-good inStock=42 (4 ms)
+  🟡 circuit HALF-OPEN for inventory.check on inventory-bad — one probe call allowed
+  🟢 circuit CLOSED   for inventory.check on inventory-bad — back in rotation
+  ✓ #21 inventory-bad inStock=42 (6 ms)
+  ✓ #22 inventory-good inStock=42 (17 ms)
+  ✓ #23 inventory-bad inStock=42 (12 ms)
+  ✓ #24 inventory-good inStock=42 (4 ms)
+</code></pre>
+<p>Reading it top to bottom:</p>
+<ul>
+<li>Calls 2–10 fail on <code>inventory-bad</code>. The fifth failure (call #10) satisfies <code>minRequestCount: 5</code> with a 100 % failure rate, above the <code>threshold: 0.5</code>, so the breaker <strong>opens</strong> — the event fires while call #10 is still returning its error.</li>
+<li>From #11 on, <code>inventory-bad</code> gets nothing. Not because the client checks a flag before each call: the breaker sets the endpoint&#39;s <code>state</code> to unavailable in the local registry, so the load balancer simply does not see it any more. Every call goes to <code>inventory-good</code>. <strong>The error rate drops from 50 % to zero without touching the broken node.</strong></li>
+<li>We fix the node at #12. Nothing changes immediately — the breaker does not know, and that is correct. Five seconds after it opened (<code>halfOpenTime</code>) it goes <strong>half-open</strong>: the endpoint is made visible again for exactly one call, and hidden again until that probe completes.</li>
+<li>The probe (#21) succeeds, the breaker <strong>closes</strong>, and round-robin resumes alternating. Had the probe failed, the breaker would have gone straight back to open for another 5 s.</li>
+</ul>
+<p>Two properties that are easy to get wrong when you build this yourself, and that the broker gets right because it <em>is</em> the load balancer:</p>
+<p><strong>The breaker is per endpoint — per (node, action) pair — not per service.</strong> <code>inventory.check</code> on <code>inventory-bad</code> was open while <code>inventory.check</code> on <code>inventory-good</code> was closed. A breaker per service name would have taken the healthy node down with the broken one. A breaker per node would have blocked <code>inventory.configure</code> too, and we could not have repaired it through the same channel.</p>
+<p><strong>Failure counting happens on the caller, and the caller decides what a failure is.</strong> The default <code>check</code> is <code>err.code &gt;= 500</code>: server errors and timeouts count, validation errors and not-founds do not. That is per caller; a caller with different needs (a batch job that treats slow responses as failures) can register its own <code>check</code>. There is also a wrinkle in the source worth knowing: an error that originates on a <em>third</em> node (an <code>inventory</code> handler that itself called something that failed) is not counted against the inventory endpoint — only errors raised by the node you called, or locally, are.</p>
+<p>Per-action overrides use the same shape as the broker option:</p>
+<pre><code class="language-js">actions: {
+  check: {
+    circuitBreaker: { threshold: 0.3, minRequestCount: 10 },
+    async handler(ctx) { /* … */ },
+  },
+}
+</code></pre>
+<p>And the <code>$circuit-breaker.opened</code> / <code>half-opened</code> / <code>closed</code> events are ordinary broker events — the payload has <code>nodeID</code>, <code>action</code>, <code>failures</code>, <code>count</code>, <code>rate</code> — so a monitoring service can subscribe to them like to anything else. If you have metrics enabled there are gauges for active open and half-open breakers as well.</p>
+<h2>3. Timeout: the one that is off by default</h2>
+<p><code>inventory-slow</code> answers after 3 seconds. The client calls with a per-call timeout of 1 s:</p>
+<pre><code>--- only the slow node exists
+[21:04:56.031Z] WARN  BROKER: Request &#39;inventory.check&#39; is timed out. { requestID: &#39;be7093ec-…&#39;, nodeID: &#39;inventory-slow&#39;, timeout: 1000 }
+  ✗ #1 timeout=1000 RequestTimeoutError (504) @inventory-slow: Request is timed out when call &#39;inventory.check&#39; action on &#39;inventory-slow&#39; node. (1007 ms)
+  ✗ #2 timeout=1000 RequestTimeoutError (504) @inventory-slow: … (1011 ms)
+  ✗ #3 timeout=1000 RequestTimeoutError (504) @inventory-slow: … (1005 ms)
+  ✗ #4 timeout=1000 RequestTimeoutError (504) @inventory-slow: … (1003 ms)
+</code></pre>
+<p>That is all a timeout does on its own: it turns a 3-second wait into a 1-second <code>RequestTimeoutError</code>. Useful — your request handler is unblocked and can respond with a 504 — but the user still got nothing. Now look at the error&#39;s two properties: code <code>504</code> and <code>retryable: true</code>. That is where it composes with the previous two sections.</p>
+<p>Start a healthy <code>inventory-fast</code> next to the slow one, and enable retry:</p>
+<pre><code>--- a healthy node joins; RETRY=1 turns the timeout into a failover
+[21:05:04.302Z] WARN  BROKER: Request &#39;inventory.check&#39; is timed out. { requestID: &#39;50aa1ded-…&#39;, nodeID: &#39;inventory-slow&#39;, timeout: 1000 }
+[21:05:04.305Z] WARN  BROKER: Retry to call &#39;inventory.check&#39; action after 100 ms... { requestID: &#39;50aa1ded-…&#39;, attempts: 1 }
+  ✓ #1 timeout=1000 inventory-fast inStock=42 (1164 ms)
+[21:05:05.451Z] WARN  BROKER: Request &#39;inventory.check&#39; is timed out. { requestID: &#39;7d3cfb02-…&#39;, nodeID: &#39;inventory-slow&#39;, timeout: 1000 }
+[21:05:05.452Z] WARN  BROKER: Retry to call &#39;inventory.check&#39; action after 100 ms... { requestID: &#39;7d3cfb02-…&#39;, attempts: 1 }
+  ✓ #2 timeout=1000 inventory-fast inStock=42 (1132 ms)
+  … (#3, #4 identical)
+</code></pre>
+<p>Every call now succeeds — the timeout is retryable, the retry re-selects an endpoint, round-robin hands it to <code>inventory-fast</code>. But every call also costs 1.1 s, because round-robin keeps <em>starting</em> on the slow node. Retry is the wrong tool for a node that is consistently slow; it fixes the individual call and keeps paying the tax. Add the breaker:</p>
+<pre><code>--- RETRY=1 CB=1: timeouts count as failures, so the slow node gets cut off
+  ✓ #1 timeout=1000 inventory-fast inStock=42 (11 ms)
+  ✓ #2 timeout=1000 inventory-fast inStock=42 (1110 ms)
+  ✓ #3 timeout=1000 inventory-fast inStock=42 (1108 ms)
+  ✓ #4 timeout=1000 inventory-fast inStock=42 (1109 ms)
+  ✓ #5 timeout=1000 inventory-fast inStock=42 (1109 ms)
+  🔴 circuit OPENED   for inventory.check on inventory-slow (5/5 failed)
+  ✓ #6 timeout=1000 inventory-fast inStock=42 (1108 ms)
+  ✓ #7 timeout=1000 inventory-fast inStock=42 (6 ms)
+  ✓ #8 timeout=1000 inventory-fast inStock=42 (7 ms)
+  ✓ #9 timeout=1000 inventory-fast inStock=42 (7 ms)
+  ✓ #10 timeout=1000 inventory-fast inStock=42 (5 ms)
+</code></pre>
+<p>Five timeouts (504 ≥ 500, so they count) open the breaker on <code>inventory-slow</code>, and from #7 on the calls are 5 ms. Nobody wrote any failover logic; three independent guards, each doing its narrow job, produced it. This composition is the actual point of the post — and it is also why the broker applies them in a fixed order, which matters:</p>
+<ul>
+<li><strong>Fallback</strong> is the outermost layer — it only kicks in after everything else has given up.</li>
+<li><strong>Retry</strong> wraps <strong>Timeout</strong>, so <em>each attempt</em> gets the full timeout; a retried call can take <code>retries × timeout</code> in the worst case. Budget accordingly.</li>
+<li><strong>Timeout</strong> wraps the <strong>Circuit breaker</strong>, so a timed-out attempt is reported to the breaker as a failure of that endpoint.</li>
+<li><strong>Bulkhead</strong> (section 6) is innermost and runs on the callee.</li>
+</ul>
+<p>The timeout can be set on three levels, most specific wins: per call (<code>{ timeout: 1000 }</code> in the options, as above), per action (<code>timeout: 1000</code> in the action schema — the callee saying &quot;I should never take longer than this&quot;), and per broker (<code>requestTimeout</code>). Set the broker-level one in every production config. A wrong value is better than <code>0</code>.</p>
+<h2>4. Distributed timeout: the budget travels with the request</h2>
+<p>This is the part that a per-call timeout library cannot do for you. <code>orders.create</code> calls <code>inventory.check</code> (800 ms) and then <code>shipping.quote</code> (800 ms). The client calls <code>orders.create</code> with a timeout. First with a 3 s budget:</p>
+<pre><code>--- 3 s budget: fits
+  ✓ orders.create timeout=3000 → inStock=42 timings={&quot;inventory&quot;:813,&quot;shipping&quot;:817} (1733 ms)
+</code></pre>
+<p>Then with 1.5 s, which is less than the two hops need:</p>
+<pre><code>--- 1.5 s budget: the second hop only gets what is left
+[21:05:23.513Z] WARN  BROKER: Request &#39;orders.create&#39; is timed out. { requestID: &#39;6cd10b50-…&#39;, nodeID: &#39;app-1&#39;, timeout: 1500 }
+  ✗ orders.create timeout=1500 → RequestTimeoutError (504) @app-1: Request is timed out when call &#39;orders.create&#39; action on &#39;app-1&#39; node. (1506 ms)
+--- what app-1 (the orders node) logged meanwhile:
+[21:05:23.513Z] WARN  BROKER: Request &#39;shipping.quote&#39; is timed out. { requestID: &#39;6cd10b50-…&#39;, nodeID: &#39;app-1&#39;, timeout: 694.221156 }
+</code></pre>
+<p>Look at the second log line, from the orders node. The <code>shipping.quote</code> call was made with a timeout of <strong>694.22 ms</strong> — nobody wrote that number. The client&#39;s 1500 ms was carried in the request to <code>app-1</code>; <code>app-1</code> spent ~806 ms on the inventory hop; when it made the next call, the broker subtracted the elapsed time and passed the remainder down. Both sides timed out at the same millisecond (<code>23.513Z</code>), with the same <code>requestID</code>, and the client got its answer at 1506 ms, not at 1600 or 2300.</p>
+<p>In distributed-systems vocabulary this is <strong>deadline propagation</strong> — the thing gRPC does with deadlines and that most HTTP stacks do not do at all. Without it, a 1.5 s timeout at the edge and a 1.5 s timeout on each inner hop means a request can keep a chain of services busy for 3 s after the caller has already given up on it. With it, the whole tree is cut at the same instant. If the budget is already exhausted when a call is about to be made, the broker does not even send it — you get a <code>RequestSkippedError</code> instead, and that one is deliberately <em>not</em> retryable: there is no budget left to retry with.</p>
+<h2>5. Fallback: degrade instead of failing</h2>
+<p>Retry and breaker decide <em>whether</em> to keep trying. When they give up, <code>fallbackResponse</code> decides what the caller gets instead of an exception. Inventory is fully down (<code>FAIL_RATE=1</code>, single node):</p>
+<pre><code class="language-js">const res = await broker.call(&quot;inventory.check&quot;, { sku: &quot;SKU-1&quot; }, {
+  fallbackResponse: (ctx, err) =&gt; {
+    console.log(`  ↩ fallback used because: ${err.name} (${err.code})`);
+    return { sku: ctx.params.sku, inStock: null, stale: true };
+  },
+});
+</code></pre>
+<pre><code>[21:05:27.838Z] WARN  BROKER: The &#39;inventory.check&#39; request is failed. Return fallback response. { requestID: &#39;06fa6dc8-…&#39;, err: &#39;inventory database unavailable&#39; }
+  ↩ fallback used because: MoleculerRetryableError (503) @inventory-1
+  result: { sku: &#39;SKU-1&#39;, inStock: null, stale: true }
+</code></pre>
+<p><code>fallbackResponse</code> can be a value or a function of <code>(ctx, err)</code> — the function form is where you read from a cache, return the last known value, or return a &quot;we&#39;ll confirm by email&quot; answer. The broker sets <code>ctx.fallbackResult = true</code> so tracing and metrics can tell a real answer from a degraded one. On the callee side there is a mirror of this: an action can declare <code>fallback: &quot;methodName&quot;</code> (or a function) in its schema, which runs when the <em>handler</em> throws — useful for the &quot;serve from cache when the DB is down&quot; case where the service knows its own fallback better than every caller does.</p>
+<p>A product page that shows &quot;stock: unknown&quot; is a product page. A product page that shows a 500 is not. The fallback is where the difference is made, and it is one option on the call.</p>
+<h2>6. Bulkhead: don&#39;t let one endpoint sink the ship</h2>
+<p>The last guard is on the <em>callee</em>. <code>orders.report</code> is expensive (300 ms of pretend work) and declares a bulkhead of two concurrent executions and a queue of three:</p>
+<pre><code class="language-js">report: {
+  bulkhead: { enabled: true, concurrency: 2, maxQueueSize: 3 },
+  async handler(ctx) {
+    await new Promise((r) =&gt; setTimeout(r, 300));
+    return { ok: true, servedBy: this.broker.nodeID };
+  },
+},
+</code></pre>
+<p>Ten calls fired at once with <code>Promise.allSettled</code>:</p>
+<pre><code>  ✓ #0 ok
+  ✓ #1 ok
+  ✓ #2 ok
+  ✓ #3 ok
+  ✓ #4 ok
+  ✗ #5 QueueIsFullError (429) @app-1: Queue is full. Request &#39;orders.report&#39; action on &#39;client-3475145&#39; node is rejected.
+  ✗ #6 QueueIsFullError (429) @app-1: Queue is full. …
+  ✗ #7 QueueIsFullError (429) @app-1: Queue is full. …
+  ✗ #8 QueueIsFullError (429) @app-1: Queue is full. …
+  ✗ #9 QueueIsFullError (429) @app-1: Queue is full. …
+  total 951 ms
+</code></pre>
+<p>Two run, three wait, five are rejected <em>immediately</em> with a 429 — they do not sit in an unbounded queue eating memory and dragging the p99 of everything else on that node. The five accepted ones finish in three batches (2 + 2 + 1 ≈ 950 ms). The name comes from the watertight compartments in a ship&#39;s hull: a flood in one does not sink the whole thing. The bulkhead can be declared per action, as here, or for the whole broker (<code>bulkhead: { enabled: true, concurrency: 10, maxQueueSize: 100 }</code>). Note that <code>QueueIsFullError</code> <em>is</em> marked retryable: with a retry policy on the caller, a rejected call is retried after the backoff, and with several instances of the service that usually lands on a less busy one — a reasonable default. With a single instance it means retrying against the same full queue, which is one more place where a per-action <code>retryPolicy: { enabled: false }</code> earns its keep.</p>
+<p>(One quirk visible in the log: the node named in the error message is the <em>caller</em>, because <code>ctx.nodeID</code> on the callee side refers to the sender of the request. The <code>@app-1</code> prefix — which is <code>err.nodeID</code>, the node that threw — is the one that tells you where the queue actually lives.)</p>
+<h2>What to put in production</h2>
+<p>A reasonable baseline that I would start any Moleculer 0.15 project from:</p>
+<pre><code class="language-js">module.exports = {
+  requestTimeout: 5 * 1000,
+  retryPolicy: { enabled: true, retries: 3, delay: 100, maxDelay: 2000, factor: 2 },
+  circuitBreaker: { enabled: true, threshold: 0.5, minRequestCount: 20, windowTime: 60, halfOpenTime: 10 * 1000 },
+  bulkhead: { enabled: true, concurrency: 50, maxQueueSize: 200 },
+};
+</code></pre>
+<p>Then, per action, turn retries <em>off</em> on anything non-idempotent, set a tighter <code>timeout</code> on anything user-facing, and add <code>fallback</code>s where a degraded answer is better than none. The defaults you are overriding — no timeout, no retry, no breaker — are the right defaults for a framework that does not know your system, and the wrong ones for any system that has users.</p>
+<p>The framework&#39;s contribution is not that it has a circuit breaker; every resilience library has one. It is that the breaker, the retry, the timeout, the load balancer and the registry are the same component, so the timeout knows how much budget is left, the retry knows there is another node, and the breaker can take an endpoint out of rotation instead of throwing faster. Three guards, one config block, and the failover in section 3 falls out of it.</p>
+<hr>
+<p><em>Code for this post: <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/06-circuit-breaker-retry-timeout">examples/06-resilience</a> — <code>run.sh</code> reproduces all six demos against a local NATS. Moleculer 0.15.2, Node 22.</em></p>
+<p><em>Previous in the series: Service discovery and load balancing in Node.js. Next: event-driven architecture — pub/sub with NATS, Kafka and Redis.</em></p>
+
+</article>
+</body>
+</html>

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event-driven architecture in Node.js: pub/sub with NATS, Kafka and Redis — and when an event is not enough</title>
+<meta name="description" content="Emit vs broadcast, consumer groups, request context across hops, the same code on three transporters — and durable channels for when a lost event is not acceptable.">
+<style>
+body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
+pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+code { font: 0.9em ui-monospace, Menlo, Consolas, monospace; }
+img { max-width: 100%; }
+blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; color: #555; }
+</style>
+</head>
+<body>
+<article>
+<h1>Event-driven architecture in Node.js: pub/sub with NATS, Kafka and Redis — and when an event is not enough</h1>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/07-event-driven-pubsub/hero.jpg" alt="A brass pneumatic-tube manifold labelled MOLECULER routing capsules from ORDERS to MAILER, ANALYTICS and INVENTORY — the MAILER tube is disconnected and a capsule tagged LOST lies on the desk"></p>
+<p>Request/response is how a microservice system starts, and events are how it stops being a distributed monolith. The moment <code>orders</code> has to <em>call</em> <code>mailer</code>, <code>analytics</code> and <code>inventory</code> after every checkout, <code>orders</code> knows about three services it should not care about, is as slow as the slowest of them, and fails when any of them is down. Flip it around — <code>orders</code> announces &quot;order created&quot;, and whoever cares subscribes — and the coupling goes away.</p>
+<p>Then two questions show up that every pub/sub design has to answer, and that most tutorials skip: <strong>who exactly gets the event</strong> when a subscriber runs in three copies, and <strong>what happens to it when nobody is listening</strong>. This post answers both with running code, on three different message brokers, and ends with the part where a plain event is the wrong tool and you need something with an acknowledgement.</p>
+<p>Every snippet was executed; the logs are pasted, not typed. The code is in the <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/07-event-driven-pubsub">example repo</a> (<code>run.sh</code> reproduces all five demos).</p>
+<blockquote>
+<p>If you are new to <a href="https://moleculer.services">Moleculer</a>: a <strong>service</strong> is a plain object with <strong>actions</strong> (request/response) and <strong>events</strong> (pub/sub handlers); a <strong>broker</strong> runs services and connects nodes over a <strong>transporter</strong> — the message broker in the middle, which can be NATS, Redis, Kafka, MQTT, AMQP or plain TCP. <code>broker.emit(&quot;order.created&quot;, payload)</code> is the publish side; an <code>events: { &quot;order.created&quot;(ctx) {} }</code> block is the subscribe side. The routing logic — which subscriber instance gets what — is Moleculer&#39;s own and is the same on every transporter, which is what makes the &quot;same code, three brokers&quot; section below possible.</p>
+</blockquote>
+<h2>The setup: one producer, two kinds of consumers</h2>
+<p><code>orders</code> creates orders and announces them. Two subscribers: <code>mailer</code> (which we will run twice, to see load balancing) and <code>analytics</code> (which listens with a wildcard).</p>
+<pre><code class="language-js">// services/orders.service.js
+module.exports = {
+  name: &quot;orders&quot;,
+  created() { this.seq = 0; },
+
+  actions: {
+    create: {
+      params: { sku: &quot;string&quot;, qty: { type: &quot;number&quot;, default: 1 } },
+      async handler(ctx) {
+        const order = { id: ++this.seq, sku: ctx.params.sku, qty: ctx.params.qty, total: ctx.params.qty * 10 };
+        log(this, `orders.create #${order.id} (${order.sku}) — requestID ${ctx.requestID.slice(0, 8)}, level ${ctx.level}`);
+        // event: delivered to ONE instance of every subscriber service that is online right now
+        await ctx.emit(&quot;order.created&quot;, order);
+        return order;
+      },
+    },
+    cancel: {
+      params: { id: &quot;number&quot; },
+      async handler(ctx) {
+        // broadcast: delivered to EVERY instance of every subscriber service
+        await ctx.broadcast(&quot;order.cancelled&quot;, { id: ctx.params.id });
+        return { id: ctx.params.id, cancelled: true };
+      },
+    },
+  },
+};
+</code></pre>
+<pre><code class="language-js">// services/mailer.service.js
+module.exports = {
+  name: &quot;mailer&quot;,
+  events: {
+    &quot;order.created&quot;: {
+      // event payloads can be validated like action params (same fastest-validator schema)
+      params: { id: &quot;number&quot;, sku: &quot;string&quot;, total: &quot;number&quot; },
+      async handler(ctx) {
+        const { id, sku } = ctx.params;
+        log(this, `order.created #${id} (${sku}) — requestID ${ctx.requestID.slice(0, 8)}, meta.user ${ctx.meta.user}, level ${ctx.level}`);
+        // events can chain: the context carries the same requestID one level deeper
+        await ctx.emit(&quot;email.sent&quot;, { orderId: id, to: `${ctx.meta.user}@example.com` });
+      },
+    },
+    &quot;order.cancelled&quot;(ctx) {
+      log(this, `order.cancelled #${ctx.params.id} — dropping queued emails for it`);
+    },
+  },
+};
+</code></pre>
+<pre><code class="language-js">// services/analytics.service.js
+module.exports = {
+  name: &quot;analytics&quot;,
+  events: {
+    &quot;order.*&quot;(ctx) {
+      log(this, `${ctx.eventName} #${ctx.params.id} — ${ctx.eventType} from ${ctx.nodeID}, level ${ctx.level}`);
+    },
+    &quot;email.sent&quot;(ctx) {
+      log(this, `email.sent for #${ctx.params.orderId} to ${ctx.params.to} — requestID ${ctx.requestID.slice(0, 8)}, level ${ctx.level}`);
+    },
+  },
+};
+</code></pre>
+<p>(<code>log</code> prefixes the line with a timestamp and the node ID so the logs of four processes can be merged in order — that is all it does.)</p>
+<p>The config is two lines that matter. The transporter is an environment variable because we are going to swap it:</p>
+<pre><code class="language-js">// moleculer.config.js
+module.exports = {
+  nodeID: process.env.NODE_NAME || `node-${process.pid}`,
+  transporter: process.env.TRANSPORTER || &quot;nats://localhost:4222&quot;,
+  // &quot;redis://localhost:6379&quot;  or  &quot;kafka://localhost:9092&quot; — nothing else changes
+};
+</code></pre>
+<p>Four nodes, each started with <code>moleculer-runner</code> and a <code>SERVICES=</code> filter: <code>app-1</code> (orders), <code>mailer-1</code>, <code>mailer-2</code>, <code>analytics-1</code>. A fifth throwaway broker (<code>client.js</code>) calls <code>orders.create</code> four times with <code>meta: { user: &quot;alice&quot; }</code>, then <code>orders.cancel</code> once.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/07-event-driven-pubsub/diagram-emit-broadcast.png" alt="Where an emitted event goes vs. a broadcast one"></p>
+<h2>1. <code>emit</code> is balanced, <code>broadcast</code> is not</h2>
+<pre><code>--- 4× orders.create (each one emits order.created)
+[app-1] orders.create #1 (SKU-1) — requestID 3b5d9c00, level 1
+[analytics-1] order.created #1 — emit from app-1, level 2
+[mailer-2] order.created #1 (SKU-1) — requestID 3b5d9c00, meta.user alice, level 2
+[analytics-1] email.sent for #1 to alice@example.com — requestID 3b5d9c00, level 3
+[app-1] orders.create #2 (SKU-2) — requestID 128071b0, level 1
+[analytics-1] order.created #2 — emit from app-1, level 2
+[mailer-1] order.created #2 (SKU-2) — requestID 128071b0, meta.user alice, level 2
+[analytics-1] email.sent for #2 to alice@example.com — requestID 128071b0, level 3
+[app-1] orders.create #3 (SKU-3) — requestID ab6b4a4f, level 1
+[analytics-1] order.created #3 — emit from app-1, level 2
+[mailer-2] order.created #3 (SKU-3) — requestID ab6b4a4f, meta.user alice, level 2
+[analytics-1] email.sent for #3 to alice@example.com — requestID ab6b4a4f, level 3
+[app-1] orders.create #4 (SKU-4) — requestID e1966cc6, level 1
+[mailer-1] order.created #4 (SKU-4) — requestID e1966cc6, meta.user alice, level 2
+[analytics-1] order.created #4 — emit from app-1, level 2
+[analytics-1] email.sent for #4 to alice@example.com — requestID e1966cc6, level 3
+--- orders.cancel #2 (broadcasts order.cancelled)
+[mailer-2] order.cancelled #2 — dropping queued emails for it
+[analytics-1] order.cancelled #2 — broadcast from app-1, level 2
+[mailer-1] order.cancelled #2 — dropping queued emails for it
+</code></pre>
+<p>Three things in this log, in order of how often they surprise people.</p>
+<p><strong>Each <code>order.created</code> reached one mailer, not two.</strong> <code>emit</code> is a <em>balanced</em> event: every subscribing <strong>service</strong> gets the event once, and if that service runs in several instances, the emitter&#39;s registry picks one — mailer-2, mailer-1, mailer-2, mailer-1: round-robin, the same strategy the load balancer uses for action calls. <code>analytics</code> is a different service, so it gets its own copy of every event. In broker vocabulary each service name is an <strong>event group</strong>, and <code>emit</code> delivers one copy per group. This is what a queue-group or consumer-group gives you in NATS or Kafka, except it works identically on all transporters because the choice is made by the emitting broker, not by the message broker. (One consequence: if the emitting node also hosts an instance of the subscriber, that local instance always wins — <code>registry.preferLocal</code> applies to events too.)</p>
+<p><strong><code>order.cancelled</code> reached both mailers.</strong> <code>broadcast</code> goes to every instance of every subscriber. That is the right verb for &quot;flush your cache&quot;, &quot;reload config&quot;, &quot;a node joined&quot; — anything where each process has to react. For &quot;an order was created, someone send the email&quot;, it would send two emails. There is also <code>broadcastLocal</code>, which only reaches services in the same process, and it is what the broker&#39;s own <code>$node.connected</code>/<code>$services.changed</code> events use.</p>
+<p><strong>The request ID survived two hops and the user survived with it.</strong> <code>orders.create</code> ran at level 1 with request <code>3b5d9c00</code>; the mailer&#39;s handler ran at level 2 with the same request ID and the same <code>meta.user</code> that the client put on the <em>action call</em>; the <code>email.sent</code> event that the mailer emitted from inside its handler arrived at analytics at level 3, still <code>3b5d9c00</code>. Event handlers receive a full <code>Context</code> — <code>ctx.params</code>, <code>ctx.meta</code>, <code>ctx.requestID</code>, <code>ctx.call</code> and <code>ctx.emit</code> — so an event is not a dead end for tracing or for tenant/user information. Enable the tracing middleware and this chain shows up as one trace with three spans, without passing anything by hand.</p>
+<h2>2. Groups and wildcards</h2>
+<p><code>analytics</code> subscribed to <code>order.*</code> and received both <code>order.created</code> and <code>order.cancelled</code>, with the actual name in <code>ctx.eventName</code>. Wildcards are <code>*</code> for one segment and <code>**</code> for any number — <code>**</code> is how you write an audit service that sees everything.</p>
+<p>The group can also be targeted from the emitting side. This emits <code>order.created</code> to the <code>mailer</code> group only:</p>
+<pre><code class="language-js">await broker.emit(&quot;order.created&quot;, { id: 99, sku: &quot;SKU-99&quot;, total: 0 }, [&quot;mailer&quot;]);
+</code></pre>
+<pre><code>=== 2. Event groups: emit only to the mailer group ===
+[mailer-1] order.created #99 (SKU-99) — requestID dccf0532, meta.user undefined, level 1
+[analytics-1] email.sent for #99 to undefined@example.com — requestID dccf0532, level 2
+</code></pre>
+<p><code>analytics</code> never saw <code>order.created #99</code> — it only saw the <code>email.sent</code> that the mailer emitted afterwards, which had no group filter. This is handy for replays (&quot;re-send order 99 to the mailer, but do not count it again&quot;) and for the reverse case, where a service wants to <em>join</em> another service&#39;s group: an event definition can say <code>group: &quot;mailer&quot;</code>, and then that handler and the real mailer share one round-robin — only one of them gets each event.</p>
+<h2>3. Validation happens at the subscriber</h2>
+<p>The mailer declared a <code>params</code> schema on its handler. What happens when a producer sends garbage?</p>
+<pre><code class="language-js">await broker.emit(&quot;order.created&quot;, { id: &quot;oops&quot; });
+</code></pre>
+<pre><code>=== 3. Event payload validation ===
+[analytics-1] order.created #oops — emit from client-3557966, level 1
+--- and on the mailer node that rejected it:
+[19:39:50.367Z] ERROR TRANSIT: ValidationError: Parameters validation error!
+    at processCheckResponse (…/node_modules/moleculer/src/validators/base.js:103:6)
+  data: [ { type: &#39;number&#39;, message: &quot;The &#39;id&#39; field must be a number.&quot;, field: &#39;id&#39;, actual: &#39;oops&#39;, nodeID: &#39;client-3557966&#39;, event: &#39;order.created&#39; }, { type: &#39;required&#39;, message: &quot;The &#39;sku&#39; field is required.&quot;, field: &#39;sku&#39;, … }, { type: &#39;required&#39;, message: &quot;The &#39;total&#39; field is required.&quot;, field: &#39;total&#39;, … } ]
+</code></pre>
+<p>Two points. The schema is enforced <em>per handler</em>: <code>analytics</code> had no schema on its wildcard handler, so it happily logged <code>#oops</code>. And the error was logged on the mailer node and went nowhere else — <code>broker.emit</code> had already resolved on the client. That is the contract of an event: <strong><code>emit</code> resolves when the event has been handed to the transporter, not when it has been handled.</strong> A handler that throws — validation or otherwise — is logged by the receiving broker and that is the end of it. If the producer needs to know the outcome, it wanted an action call, not an event. Keep that sentence in mind for section 5.</p>
+<h2>4. Same code, three brokers</h2>
+<p>Nothing in the services above mentions NATS. So let&#39;s run the same <code>bench</code> pair — one node emitting 2 000 small events, one node subscribed, counting arrival latency — on all three transporters, changing only <code>TRANSPORTER=</code>:</p>
+<pre><code>=== 4. Same code, three transporters: 2 000 events, one emitter node → one subscriber node ===
+--- TRANSPORTER=nats
+  awaited each emit: 2000 events in 346 ms (5780 events/s) — received 2000, latency p50 2 ms, p99 8 ms, max 9 ms
+  fire-and-forget: 2000 events in 305 ms (6557 events/s) — received 2000, latency p50 29 ms, p99 72 ms, max 72 ms
+--- TRANSPORTER=redis
+  awaited each emit: 2000 events in 287 ms (6969 events/s) — received 2000, latency p50 2 ms, p99 14 ms, max 16 ms
+  fire-and-forget: 2000 events in 249 ms (8032 events/s) — received 2000, latency p50 3 ms, p99 20 ms, max 20 ms
+--- TRANSPORTER=kafka
+  awaited each emit: 2000 events in 5983 ms (334 events/s) — received 2000, latency p50 4 ms, p99 19 ms, max 96 ms
+  fire-and-forget: 2000 events in 2105 ms (950 events/s) — received 2000, latency p50 1186 ms, p99 1936 ms, max 1955 ms
+</code></pre>
+<p>(&quot;Awaited each emit&quot; is a loop of <code>await broker.emit(...)</code>; &quot;fire-and-forget&quot; fires all 2 000 and then awaits the promises, so its latency numbers include queueing behind the previous 1 999. Single machine, brokers in Docker, one run — treat these as shapes, not benchmarks; the NATS and Redis numbers moved by ±50 % between runs.)</p>
+<p>The shapes are the story. NATS and Redis are in the same class: a few thousand events per second from a single emitter loop, single-digit-millisecond delivery. Kafka is 10–20× slower on this path — and this is not Kafka being slow, it is Kafka being used for something it is not built for. Here is what each transporter actually does with an event, which explains both the numbers and the durability question coming next:</p>
+<ul>
+<li><strong>NATS</strong> (<code>nats://</code>) — core NATS pub/sub. Each node subscribes to its own subject (<code>MOL.EVENT.&lt;nodeID&gt;</code>); the emitter&#39;s registry decides the target node and publishes there. At-most-once, no persistence, and the fastest of the three. NATS also has queue groups, and if you set <code>disableBalancer: true</code> Moleculer stops picking the node itself and lets NATS balance within the group instead — the only one of the three transporters that supports this.</li>
+<li><strong>Redis</strong> (<code>redis://</code>) — Redis Pub/Sub (<code>PUBLISH</code>/<code>SUBSCRIBE</code>), one channel per node. Same semantics as NATS: a message published while no subscriber is connected is dropped; there is no queue behind it. Nearly as fast, and often already in the stack.</li>
+<li><strong>Kafka</strong> (<code>kafka://</code>) — one topic per node (<code>MOL.EVENT.&lt;nodeID&gt;</code>, auto-created), every message to partition 0, and every Moleculer process is its own consumer group (<code>groupId</code> = the broker&#39;s unique instance ID). Kafka&#39;s own consumer-group balancing and offset replay are deliberately not in play — Moleculer already balanced the event in its registry and targeted a node, so the topic is just a pipe to that node. Each <code>emit</code> is a producer round trip that waits for the broker&#39;s ack, which is where the ~3 ms per event goes.</li>
+</ul>
+<p>So if you were about to pick Kafka <em>as the transporter</em> because &quot;we need durability&quot;, stop: the transporter is a transport. It gets a packet from node A to node B; the registry, the load balancing and the event routing sit above it and behave the same on all of them. Pick the transporter for operational reasons — what you already run, what your ops team can keep alive, latency — and get durability from the layer that is built for it. Which brings us to the demo that matters most.</p>
+<h2>5. What happens when the subscriber is down</h2>
+<p>The scenario every event-driven system meets on its first deploy: <code>orders</code> is up, <code>mailer</code> is being restarted, two orders come in.</p>
+<pre><code>=== 5. What happens when the subscriber is down ===
+--- events: orders runs, mailer is NOT running; create 2 orders, then start the mailer
+  → orders.create returned #1
+  → orders.create returned #2
+--- mailer log:
+(nothing — the two events were delivered to nobody and are gone)
+</code></pre>
+<p><code>emit</code> resolved happily both times. The registry had no <code>mailer</code> endpoint online, so there was no one to send to, so it sent to no one. The mailer came back three seconds later and got nothing, because nothing was stored anywhere — not in NATS, not in Redis, and (see above) not in a way Kafka would replay either. This is <strong>at-most-once delivery</strong>, and for a lot of events it is exactly right: a cache-invalidation, a &quot;user is typing&quot; indicator, a metric sample, a UI push. Losing one costs nothing, and the source of truth can be re-read.</p>
+<p>An order confirmation email is not in that category. Neither is a payment webhook, an inventory reservation, or anything that ends up in an audit log. For these you need a message that is <em>stored until acknowledged</em>, retried when the handler throws, and parked somewhere visible when it keeps failing. In Moleculer that is a separate module — <a href="https://github.com/moleculerjs/moleculer-channels"><code>@moleculer/channels</code></a> — with adapters for Redis Streams, Kafka, NATS JetStream and AMQP. It is one middleware in the config:</p>
+<pre><code class="language-js">// moleculer.config.js (with CHANNELS=1)
+const { Middleware: ChannelsMiddleware } = require(&quot;@moleculer/channels&quot;);
+
+module.exports = {
+  transporter: &quot;nats://localhost:4222&quot;,   // still the transporter for calls and events
+  middlewares: [
+    ChannelsMiddleware({
+      adapter: {
+        type: &quot;Redis&quot;,
+        options: {
+          maxRetries: 3,                                              // then dead-letter (or drop, if dead-lettering is off)
+          deadLettering: { enabled: true, queueName: &quot;FAILED_MESSAGES&quot; },
+          redis: {
+            url: &quot;redis://localhost:6379&quot;,
+            consumerOptions: { minIdleTime: 1000, claimInterval: 200, processingAttemptsInterval: 500 },
+            // minIdleTime: an unacked message is retried after 1 s (default: 1 hour)
+          },
+        },
+      },
+    }),
+  ],
+};
+</code></pre>
+<p>The producer change is one line — <code>sendToChannel</code> instead of <code>emit</code>:</p>
+<pre><code class="language-js">// services/orders.service.js — create handler
+if (process.env.CHANNELS === &quot;1&quot;) {
+  await this.broker.sendToChannel(&quot;order.created&quot;, order); // stored in the stream until a consumer acknowledges it
+} else {
+  await ctx.emit(&quot;order.created&quot;, order);
+}
+</code></pre>
+<p>And the consumer gets a <code>channels</code> block next to <code>events</code>. The handler receives the raw payload — no Moleculer context, because the message may have been written to the stream by anything, not just a broker (set <code>context: true</code> if you want <code>ctx.meta</code> and tracing carried through headers):</p>
+<pre><code class="language-js">// services/mailer.service.js
+channels: {
+  &quot;order.created&quot;: {
+    async handler(payload) {
+      log(this, `[channel] order.created #${payload.id} (${payload.sku})`);
+      if (payload.id === FAIL_ORDER) throw new Error(`SMTP is down, could not mail order #${payload.id}`);
+    },
+  },
+},
+</code></pre>
+<p>Plus a <code>support</code> service that consumes the dead-letter queue, with <code>context: true</code> so the error the adapter attached is readable from <code>ctx.headers</code>:</p>
+<pre><code class="language-js">// services/support.service.js
+channels: {
+  FAILED_MESSAGES: {
+    context: true,
+    async handler(ctx) {
+      log(this, `[dead-letter] order #${ctx.params.id} — ${ctx.headers[&quot;x-error-name&quot;]}: ${ctx.headers[&quot;x-error-message&quot;]}`);
+    },
+  },
+},
+</code></pre>
+<p>Same scenario, with a twist at the end: the mailer is started once (so its consumer group exists), then killed; two orders are created while it is down; it comes back; then order #3 is created, which this mailer instance was told to fail (<code>FAIL_ORDER=3</code>).</p>
+<pre><code>--- channels (CHANNELS=1, Redis Streams): same scenario
+mailer-1 stopped
+  → orders.create returned #1
+  → orders.create returned #2
+messages waiting in the stream: 2
+--- order #3 makes the mailer throw: retries, then dead-letter
+  → orders.create returned #3
+[app-1] orders.create #1 (SKU-1) — requestID bf278ea3, level 1
+[app-1] orders.create #2 (SKU-2) — requestID a68bf01b, level 1
+[mailer-1] [channel] order.created #1 (SKU-1)
+[mailer-1] [channel] order.created #2 (SKU-2)
+[app-1] orders.create #3 (SKU-1) — requestID a7031da1, level 1
+[mailer-1] [channel] order.created #3 (SKU-1)
+[mailer-1] [channel] order.created #3 (SKU-1)
+[mailer-1] [channel] order.created #3 (SKU-1)
+[support-1] [dead-letter] order #3 — Error: SMTP is down, could not mail order #3
+WARN  CHANNELS: Moved message to &#39;FAILED_MESSAGES&#39; 1788550869933-0
+</code></pre>
+<p>Orders #1 and #2 sat in the Redis stream (<code>XLEN</code> said 2) and were delivered the moment the mailer&#39;s consumer reconnected. Order #3 was attempted three times, a second apart — the handler threw, the message was never acknowledged, and after <code>minIdleTime</code> the adapter claimed it back and redelivered it — and after <code>maxRetries</code> it was moved to <code>FAILED_MESSAGES</code>, where the support service picked it up with the original payload and the error message in headers. Multiple mailer instances would share the consumer group, so this also load-balances, like <code>emit</code> did, but with the stream keeping score.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/07-event-driven-pubsub/diagram-events-vs-channels.png" alt="Events vs. channels: what is stored where, and what happens on failure"></p>
+<p>One trap worth knowing before your first outage: Redis Streams consumer groups start reading at <code>$</code> (new messages only) by default, so a subscriber that has <em>never</em> run does not get messages sent before its first start. Deploy consumers before producers, or set <code>redis.startID: &quot;0&quot;</code> on the channel. Kafka and JetStream adapters have the equivalent knobs (<code>fromBeginning</code>, stream config).</p>
+<h2>Which one, when</h2>
+<p>The framework gives you two verbs with different guarantees, and the mistake is treating them as one:</p>
+<ul>
+<li><strong><code>emit</code> / <code>broadcast</code> (events)</strong> — routed by the registry to whoever is online <em>now</em>, one copy per service (or per instance), at-most-once, transporter-agnostic, sub-10 ms. Use them to decouple services when losing an occasional message is acceptable or recoverable: cache invalidation, live updates, metrics, &quot;something changed, go re-read it&quot;. This covers more of a typical system than people expect.</li>
+<li><strong><code>sendToChannel</code> (channels)</strong> — stored in Redis Streams / Kafka / JetStream / AMQP until acknowledged, retried, dead-lettered, consumer-group balanced. Use it for anything with a cost of loss: emails, payments, stock movements, outbox patterns, integration with non-Moleculer producers and consumers.</li>
+<li><strong>The transporter</strong> is neither of these. It is the wire between nodes for calls <em>and</em> events, and its choice does not change what <code>emit</code> guarantees. NATS if you can choose; Redis if it is already there; Kafka as a transporter only when you have a reason that is not &quot;durability&quot; — for durability use it as a channel adapter instead.</li>
+</ul>
+<p>If you take one thing from the logs: in section 1 the mailer got every event, in section 5 it got none, and the code was identical. The difference was whether it was running. Design your event handlers for that — and reach for a channel when you cannot.</p>
+<hr>
+<p><em>Code for this post: <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/07-event-driven-pubsub">examples/07-event-driven</a> — <code>run.sh</code> reproduces all five demos against local NATS, Redis and Kafka containers. Moleculer 0.15.2, @moleculer/channels 0.3.1, Node 22.</em></p>
+<p><em>Previous in the series: Circuit breaker, retry and timeout in Node.js microservices. Next: Moleculer vs gRPC and tRPC — RPC transport vs. a full service layer.</em></p>
+
+</article>
+</body>
+</html>

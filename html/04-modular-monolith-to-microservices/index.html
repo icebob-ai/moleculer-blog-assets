@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>From a modular monolith to microservices without a rewrite</title>
+<meta name="description" content="Draw the module boundaries now, move the process boundaries later. Three stages on the same Express app, with the bug that shows up the moment you run two instances.">
+<style>
+body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
+pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+code { font: 0.9em ui-monospace, Menlo, Consolas, monospace; }
+img { max-width: 100%; }
+blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; color: #555; }
+</style>
+</head>
+<body>
+<article>
+<h1>From a modular monolith to microservices without a rewrite</h1>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/04-modular-monolith-to-microservices/hero.jpg" alt="An architect&#39;s model with rooms labelled USERS, ORDERS and INVENTORY; a hand has lifted the MAILER room out and set it on its own base with a MOLECULER plate, the building left intact"></p>
+<p>Most &quot;monolith to microservices&quot; stories go one of two ways. Either it&#39;s a rewrite that takes eighteen months and ships a system nobody asked for, or it&#39;s a big-bang split into fifteen services that immediately need a Kubernetes team. Both come from the same mistake: treating &quot;process boundaries&quot; and &quot;module boundaries&quot; as the same decision.</p>
+<p>They aren&#39;t. You can draw the module boundaries now, inside the monolith, and move the process boundaries later — one service at a time, when you have a reason to. This article shows exactly that with a small Express app: three stages, the same service files in every stage, and real output at each step, including the one thing that <em>does</em> break when you finally run two copies of a service.</p>
+<h2>The starting point</h2>
+<p>A perfectly ordinary Express monolith. Three modules, wired together with <code>require()</code>, one process.</p>
+<pre><code class="language-js">// lib/orders.js — calls users and mailer through plain imports. Tight coupling, zero ceremony.
+const users = require(&quot;./users&quot;);
+const mailer = require(&quot;./mailer&quot;);
+
+let counter = 0;
+const orders = [];
+
+exports.create = ({ userId, item, amount }) =&gt; {
+  const user = users.get(userId);
+  const order = { id: ++counter, userId, item, amount };
+  orders.push(order);
+  mailer.send(user.email, `Order #${order.id} confirmed (${item})`);
+  return order;
+};
+</code></pre>
+<pre><code class="language-js">// app.js
+const express = require(&quot;express&quot;);
+const users = require(&quot;./lib/users&quot;);
+const orders = require(&quot;./lib/orders&quot;);
+
+const app = express();
+app.use(express.json());
+
+app.get(&quot;/users/:id&quot;, (req, res) =&gt; res.json(users.get(Number(req.params.id))));
+app.post(&quot;/orders&quot;, (req, res) =&gt; {
+  const userId = Number(req.header(&quot;x-user-id&quot;));
+  res.status(201).json(orders.create({ userId, ...req.body }));
+});
+
+app.listen(process.env.PORT || 3000);
+</code></pre>
+<pre><code>$ curl -s localhost:3000/users/1
+{&quot;id&quot;:1,&quot;name&quot;:&quot;Ada&quot;,&quot;email&quot;:&quot;ada@example.com&quot;}
+$ curl -s -X POST localhost:3000/orders -H &#39;content-type: application/json&#39; -H &#39;x-user-id: 2&#39; -d &#39;{&quot;item&quot;:&quot;Monitor&quot;,&quot;amount&quot;:329}&#39;
+{&quot;id&quot;:1,&quot;userId&quot;:2,&quot;item&quot;:&quot;Monitor&quot;,&quot;amount&quot;:329}
+</code></pre>
+<p>Nothing wrong with this. It&#39;s the right architecture for a team of three with one deployable. The problem only starts when <code>orders</code> grows a queue consumer, <code>mailer</code> needs to scale independently because a marketing campaign sends 200k emails, and you realise nothing in the codebase says which module is allowed to call which.</p>
+<h2>Stage 1: module boundaries become service boundaries — same process</h2>
+<p>Bring in a <strong>service broker</strong> (Moleculer&#39;s <code>ServiceBroker</code> — think of it as an in-process service runtime with a registry) and turn each module into a <strong>service</strong>: a plain object with a name and <strong>actions</strong> (its callable endpoints). No transporter is configured, so every call is an in-memory function call. No network, no serialization, no new infrastructure.</p>
+<pre><code class="language-js">// services/orders.service.js — lib/orders.js as a service.
+// No require(&quot;./users&quot;) any more: the dependency goes through the broker, and is declared.
+let counter = 0;                       // module-level state — fine in a monolith; see &quot;What breaks&quot; below
+const orders = [];
+
+module.exports = {
+  name: &quot;orders&quot;,
+  dependencies: [&quot;users&quot;],             // broker waits for `users` before starting this service
+  actions: {
+    create: {
+      params: {
+        userId: { type: &quot;number&quot;, convert: true },
+        item: &quot;string&quot;,
+        amount: { type: &quot;number&quot;, positive: true },
+      },
+      async handler(ctx) {
+        const user = await ctx.call(&quot;users.get&quot;, { id: ctx.params.userId });
+        const order = { id: ++counter, userId: user.id, item: ctx.params.item, amount: ctx.params.amount };
+        orders.push(order);
+        await ctx.emit(&quot;order.created&quot;, { order, user });
+        return { ...order, servedBy: this.broker.nodeID, usersServedBy: user.servedBy };
+      },
+    },
+  },
+};
+</code></pre>
+<p>Three things changed and they are all improvements you&#39;d want anyway:</p>
+<ul>
+<li><strong>The dependency is explicit.</strong> <code>dependencies: [&quot;users&quot;]</code> is documentation the runtime enforces — <code>orders</code> won&#39;t start until <code>users</code> is available.</li>
+<li><strong>The input is validated at the boundary.</strong> <code>params</code> is a schema; a bad <code>amount</code> is rejected before the handler runs.</li>
+<li><strong>Mailer is no longer called — it&#39;s notified.</strong> <code>orders</code> emits <code>order.created</code>; whoever cares subscribes. That&#39;s the seam you&#39;ll use later to move it out.</li>
+</ul>
+<pre><code class="language-js">// services/mailer.service.js — lib/mailer.js as a service. Instead of being called, it reacts to an event.
+module.exports = {
+  name: &quot;mailer&quot;,
+  events: {
+    &quot;order.created&quot;(ctx) {
+      const { order, user } = ctx.params;
+      this.logger.info(`→ ${user.email}: Order #${order.id} confirmed (${order.item})`);
+    },
+  },
+};
+</code></pre>
+<p>Express stays. The routes call the broker instead of the modules:</p>
+<pre><code class="language-js">// app.js — the same Express app, now with a broker inside. Routes call services instead of modules.
+const express = require(&quot;express&quot;);
+const { ServiceBroker } = require(&quot;moleculer&quot;);
+
+const broker = new ServiceBroker({
+  nodeID: `app-${process.pid}`,
+  transporter: process.env.TRANSPORTER || null,     // null = local bus, in-process only
+  logger: { type: &quot;Console&quot;, options: { level: &quot;info&quot;, formatter: &quot;short&quot; } },
+});
+
+const wanted = process.env.SERVICES === undefined ? [&quot;users&quot;, &quot;orders&quot;, &quot;mailer&quot;] : process.env.SERVICES.split(&quot;,&quot;).filter(Boolean);
+for (const name of wanted) broker.createService(require(`./services/${name}.service.js`));
+
+const app = express();
+app.use(express.json());
+
+app.get(&quot;/users/:id&quot;, async (req, res, next) =&gt; {
+  try { res.json(await broker.call(&quot;users.get&quot;, { id: req.params.id })); } catch (e) { next(e); }
+});
+app.post(&quot;/orders&quot;, async (req, res, next) =&gt; {
+  try {
+    const userId = Number(req.header(&quot;x-user-id&quot;));
+    res.status(201).json(await broker.call(&quot;orders.create&quot;, { userId, ...req.body }));
+  } catch (e) { next(e); }
+});
+app.use((err, req, res, next) =&gt; res.status(err.code || 500).json({ error: err.name, message: err.message }));
+
+broker.start().then(() =&gt; {
+  app.listen(process.env.PORT || 3000, () =&gt; broker.logger.info(`HTTP on ${process.env.PORT || 3000}`));
+});
+</code></pre>
+<pre><code>$ node app.js
+[20:06:31.508Z] INFO  BROKER: Node ID: app-3470689
+[20:06:31.549Z] INFO  ORDERS: Waiting for service(s) &#39;users&#39;...
+[20:06:31.557Z] INFO  USERS: Service &#39;users&#39; started.
+[20:06:31.557Z] INFO  MAILER: Service &#39;mailer&#39; started.
+[20:06:32.552Z] INFO  ORDERS: Service(s) &#39;users&#39; are available.
+[20:06:32.554Z] INFO  ORDERS: Service &#39;orders&#39; started.
+[20:06:32.554Z] INFO  BROKER: ✔ ServiceBroker with 4 service(s) started successfully in 1s.
+[20:06:32.557Z] INFO  BROKER: HTTP on 3000
+
+$ curl -s localhost:3000/users/1
+{&quot;id&quot;:1,&quot;name&quot;:&quot;Ada&quot;,&quot;email&quot;:&quot;ada@example.com&quot;,&quot;servedBy&quot;:&quot;app-3470689&quot;}
+$ curl -s -X POST localhost:3000/orders -H &#39;content-type: application/json&#39; -H &#39;x-user-id: 2&#39; -d &#39;{&quot;item&quot;:&quot;Monitor&quot;,&quot;amount&quot;:329}&#39;
+{&quot;id&quot;:1,&quot;userId&quot;:2,&quot;item&quot;:&quot;Monitor&quot;,&quot;amount&quot;:329,&quot;servedBy&quot;:&quot;app-3470689&quot;,&quot;usersServedBy&quot;:&quot;app-3470689&quot;}
+# app log:
+[20:06:34.088Z] INFO  MAILER: → linus@example.com: Order #1 confirmed (Monitor)
+</code></pre>
+<p>Same behaviour, same single process, same deploy. <code>servedBy</code> and <code>usersServedBy</code> are the same node because everything is local. You could stop here for a year and still be better off than before: the boundaries are real, the contracts are validated, and nobody can sneak a <code>require(&quot;../orders/db&quot;)</code> across modules any more.</p>
+<p>This is what &quot;modular monolith&quot; should mean in practice — not a folder convention, but boundaries a runtime knows about.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/04-modular-monolith-to-microservices/diagram-stages.png" alt="Same three service files at every stage. Only the deployment changes."></p>
+<h2>Stage 2: extract one service — the one that actually needs it</h2>
+<p>Marketing week: <code>mailer</code> needs to scale on its own and must not slow down the request path. So move <em>only</em> <code>mailer</code> out.</p>
+<p>Two changes, neither of them in service code. First, give the app a <strong>transporter</strong> (a message broker — NATS here) and tell it which services to host locally:</p>
+<pre><code>$ TRANSPORTER=nats://localhost:4222 SERVICES=users,orders node app.js
+</code></pre>
+<p>Second, start <code>mailer</code> in its own process with <code>moleculer-runner</code>, the framework&#39;s CLI service host, pointed at the same <code>services/</code> folder:</p>
+<pre><code class="language-js">// moleculer.config.js — for services that run OUTSIDE the app process, via moleculer-runner.
+module.exports = {
+  nodeID: `svc-${process.env.SERVICES || &quot;all&quot;}-${process.pid}`,
+  transporter: process.env.TRANSPORTER || &quot;nats://localhost:4222&quot;,
+  logger: { type: &quot;Console&quot;, options: { level: &quot;info&quot;, formatter: &quot;short&quot; } },
+};
+</code></pre>
+<pre><code>$ SERVICEDIR=services SERVICES=mailer npx moleculer-runner --config moleculer.config.js
+</code></pre>
+<p>Now hit the same endpoints:</p>
+<pre><code>$ curl -s -X POST localhost:3000/orders -H &#39;content-type: application/json&#39; -H &#39;x-user-id: 2&#39; -d &#39;{&quot;item&quot;:&quot;Monitor&quot;,&quot;amount&quot;:329}&#39;
+{&quot;id&quot;:1,&quot;userId&quot;:2,&quot;item&quot;:&quot;Monitor&quot;,&quot;amount&quot;:329,&quot;servedBy&quot;:&quot;app-3470296&quot;,&quot;usersServedBy&quot;:&quot;app-3470296&quot;}
+
+# mailer process log:
+[20:03:06.188Z] INFO  MAILER: → linus@example.com: Order #1 confirmed (Monitor)
+</code></pre>
+<p>Look at what happened:</p>
+<ul>
+<li><code>mailer</code> received the <code>order.created</code> event <strong>in another process</strong>, over NATS. The <code>orders</code> code that emits it didn&#39;t change.</li>
+<li><code>orders</code> → <code>users</code> is still <code>app-3470296</code> → <code>app-3470296</code>: <strong>in-process</strong>. The app is connected to NATS, but the registry&#39;s default <code>preferLocal: true</code> routes a call to a local instance whenever one exists. You extracted one service and paid the network cost for exactly one hop — the one you chose.</li>
+</ul>
+<p>That&#39;s the whole method. The <code>services/</code> folder is the same in both processes; <strong>which process loads which file is a deployment decision</strong>, made per environment with two environment variables. Your dev laptop runs <code>node app.js</code> with everything local; staging runs the hybrid; production splits further. Same code.</p>
+<h2>Stage 3: split the rest, scale one — and meet the thing that breaks</h2>
+<p>Let&#39;s go all the way: <code>users</code>, <code>orders</code> and <code>mailer</code> each in their own process, <strong>two</strong> instances of <code>orders</code> because it&#39;s the hot path, and the app hosting nothing but HTTP:</p>
+<pre><code>$ SERVICEDIR=services SERVICES=users  npx moleculer-runner --config moleculer.config.js
+$ SERVICEDIR=services SERVICES=orders npx moleculer-runner --config moleculer.config.js
+$ SERVICEDIR=services SERVICES=orders npx moleculer-runner --config moleculer.config.js
+$ SERVICEDIR=services SERVICES=mailer npx moleculer-runner --config moleculer.config.js
+$ TRANSPORTER=nats://localhost:4222 SERVICES= node app.js
+
+$ for i in 1 2 3 4; do curl -s -X POST localhost:3000/orders -H &#39;content-type: application/json&#39; -H &#39;x-user-id: 1&#39; -d &#39;{&quot;item&quot;:&quot;Cable&quot;,&quot;amount&quot;:9}&#39;; echo; done
+{&quot;id&quot;:1,&quot;userId&quot;:1,&quot;item&quot;:&quot;Cable&quot;,&quot;amount&quot;:9,&quot;servedBy&quot;:&quot;svc-orders-3470323&quot;,&quot;usersServedBy&quot;:&quot;svc-users-3470321&quot;}
+{&quot;id&quot;:1,&quot;userId&quot;:1,&quot;item&quot;:&quot;Cable&quot;,&quot;amount&quot;:9,&quot;servedBy&quot;:&quot;svc-orders-3470322&quot;,&quot;usersServedBy&quot;:&quot;svc-users-3470321&quot;}
+{&quot;id&quot;:2,&quot;userId&quot;:1,&quot;item&quot;:&quot;Cable&quot;,&quot;amount&quot;:9,&quot;servedBy&quot;:&quot;svc-orders-3470323&quot;,&quot;usersServedBy&quot;:&quot;svc-users-3470321&quot;}
+{&quot;id&quot;:2,&quot;userId&quot;:1,&quot;item&quot;:&quot;Cable&quot;,&quot;amount&quot;:9,&quot;servedBy&quot;:&quot;svc-orders-3470322&quot;,&quot;usersServedBy&quot;:&quot;svc-users-3470321&quot;}
+</code></pre>
+<p>The good news: round-robin load balancing between the two <code>orders</code> instances, calls to <code>users</code> over the wire, no code changes — all of it just works.</p>
+<p>The bad news is in the first column. <strong>Order IDs 1, 1, 2, 2.</strong> Remember <code>let counter = 0</code> at the top of <code>orders.service.js</code>? Each process has its own. In the monolith it was a perfectly good ID generator; with two instances it&#39;s a duplicate-key bug that would have shipped.</p>
+<p>This is the honest part of the article. Turning modules into services is nearly free. Running two copies of one is where the monolith&#39;s hidden assumptions surface. Here is the list I check before scaling any service past one instance:</p>
+<ul>
+<li><strong>Module-level state</strong> — counters, caches, &quot;the current batch&quot;, <code>Map</code>s of sessions. Every instance gets its own. Move it to the database or a shared store, or make it instance-safe (UUIDs instead of counters; here <code>id: crypto.randomUUID()</code> is the one-line fix).</li>
+<li><strong>In-memory cache.</strong> Moleculer&#39;s default <code>Memory</code> cacher is per node; with several instances you&#39;ll serve stale data from one and fresh from another. Switch the cacher to Redis — a broker option, not a code change.</li>
+<li><strong>Anything that assumes ordering across requests.</strong> Two instances process concurrently; if order mattered, you were relying on a single event loop.</li>
+<li><strong>Transactions across services.</strong> <code>orders</code> + <code>inventory</code> in one SQL transaction worked because they were one process on one connection. Across processes it&#39;s either a saga (compensating actions on failure) or you keep those two in the same service. Both are fine; pretending it&#39;s still atomic is not.</li>
+<li><strong><code>ctx.meta</code> instead of globals.</strong> The request-scoped things you used to keep in <code>req</code> or a module variable (user ID, locale, trace ID) now need to ride along explicitly. Moleculer propagates <code>ctx.meta</code> through every call and event automatically — put them there.</li>
+</ul>
+<p>None of these are Moleculer problems, and none of them are avoided by any other framework; they&#39;re the actual difference between one process and two. The point of the staged approach is that you hit them <strong>one service at a time</strong>, with a working system on both sides, instead of all at once on cut-over day.</p>
+<h2>The migration order that works</h2>
+<p>If I were doing this to a real codebase:</p>
+<ol>
+<li><strong>Stage 1 for everything, no exceptions.</strong> Broker in the monolith, every module a service, every cross-module call a <code>ctx.call</code>, every fire-and-forget a <code>ctx.emit</code>. Ship it. It is a refactor with no infrastructure change, and it&#39;s where you discover which modules actually depend on which.</li>
+<li><strong>Extract the asynchronous ones first.</strong> Mailer, image processing, report generation, webhooks — anything that already receives events rather than answering calls. They have no callers to break and their latency doesn&#39;t sit on the request path.</li>
+<li><strong>Extract what needs to scale or deploy independently.</strong> Usually one or two hot services. Run through the &quot;what breaks&quot; list before starting the second instance.</li>
+<li><strong>Leave the rest together.</strong> A modular monolith with two extracted services is a legitimate end state, not a half-finished migration. Every boundary you didn&#39;t turn into a network hop is one that can&#39;t fail at 3 a.m.</li>
+</ol>
+<p>And keep <code>node app.js</code> — the everything-local mode — working forever. It&#39;s how a new developer runs the whole system on a laptop with no Docker, and it&#39;s how you run integration tests without a message broker. The local bus is a feature, not a stepping stone.</p>
+<hr>
+<p><em>Code in this article was run on Moleculer 0.15.2, Express 5 and Node.js 22, with NATS 2 for stages 2 and 3. The <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/04-monolith-to-microservices">moleculer-examples repository</a> has a <code>run.sh</code> that reproduces all three stages — including the duplicate-ID bug — in one go.</em></p>
+
+</article>
+</body>
+</html>

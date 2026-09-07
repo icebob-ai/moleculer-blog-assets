@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Using Moleculer with TypeScript: contracts, two service styles, and the honest caveats</title>
+<meta name="description" content="A small typed system end to end — shared contract file, schema and class style services, a caller with autocomplete — plus the places where the types stop helping.">
+<style>
+body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
+pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+code { font: 0.9em ui-monospace, Menlo, Consolas, monospace; }
+img { max-width: 100%; }
+blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; color: #555; }
+</style>
+</head>
+<body>
+<article>
+<h1>Using Moleculer with TypeScript: contracts, two service styles, and the honest caveats</h1>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/03-moleculer-with-typescript/hero.jpg" alt="A workshop conveyor: parcels tagged PARAMS pass an inspection gate labelled VALIDATION (one rejected with a red light), then ride inside blue precision rails labelled TYPES on a machine with a MOLECULER nameplate"></p>
+<p>&quot;Does Moleculer work with TypeScript?&quot; is the second most common question I get about it, right after the NestJS one. The short answer is yes — it ships its own type definitions, you can write services as typed schemas or as classes, and the runner loads <code>.ts</code> files. The longer answer has a few honest caveats, and since you&#39;d hit them on day two anyway, I&#39;d rather put them in the article.</p>
+<p>This post shows a small typed system end to end: a shared contract file, two services in the two supported styles, a caller that gets autocomplete and compile errors for wrong action names, and the dev and production ways to run it. Everything below was compiled with <code>strict: true</code> and executed as shown, on Moleculer 0.15.2, Node.js 22 and TypeScript 7.</p>
+<h2>What Moleculer gives you out of the box</h2>
+<ul>
+<li><strong>Bundled typings.</strong> <code>moleculer</code> ships <code>index.d.ts</code>; there is no <code>@types/moleculer</code>. The generics that matter: <code>ServiceSchema&lt;TSettings, TMethods, TVars&gt;</code> for typing <code>this</code> inside a service, <code>Context&lt;TParams, TMeta&gt;</code> for typing what a handler receives, and <code>broker.call&lt;TReturn, TParams&gt;()</code> for typing a call.</li>
+<li><strong>Class-based services.</strong> <code>class X extends Service</code> with <code>this.parseServiceSchema({...})</code> in the constructor is a first-class way to define a service, not a hack.</li>
+<li><strong><code>.ts</code> loading in the runner.</strong> <code>moleculer-runner</code> resolves <code>moleculer.config.ts</code> and <code>*.service.ts</code> files as long as a TypeScript loader is registered in the process (<code>tsx</code>, <code>ts-node</code>).</li>
+<li><strong>A TypeScript project template</strong> for the CLI (<code>moleculer-cli</code> → <code>moleculer init project-typescript my-app</code>), maintained alongside the framework.</li>
+</ul>
+<p>What it does <strong>not</strong> give you — and I&#39;ll come back to each — is a decorator API in core, dependency injection, or any type information that crosses the network. That last one is not a Moleculer limitation, it is how distributed systems work, and the trick below is how you get most of the benefit anyway.</p>
+<h2>Step 1: a contract file</h2>
+<p>Action names are strings, and by default <code>broker.call(&quot;products.get&quot;, { id: 1 })</code> returns <code>Promise&lt;any&gt;</code>. The fix is one file that says what each action takes and returns. Moleculer doesn&#39;t generate it; you write it, and both the service and every caller import it.</p>
+<pre><code class="language-ts">// src/contracts.ts — shared types for the actions in this system.
+export interface Product { id: number; name: string; price: number; }
+export interface Order { id: string; productId: number; quantity: number; total: number; }
+
+/** Action name → { params, result }. */
+export interface Actions {
+  &quot;products.get&quot;:  { params: { id: number };                       result: Product };
+  &quot;products.list&quot;: { params: { limit?: number };                   result: Product[] };
+  &quot;orders.create&quot;: { params: { productId: number; quantity: number }; result: Order };
+}
+
+/** Events and their payloads. */
+export interface Events {
+  &quot;order.created&quot;: Order;
+}
+
+/** What every request carries in ctx.meta. */
+export interface Meta { userId?: string; }
+</code></pre>
+<p>Then a ~25-line wrapper turns <code>broker.call</code> and <code>ctx.emit</code> into typed functions:</p>
+<pre><code class="language-ts">// src/typed-broker.ts
+import type { Context, ServiceBroker, CallingOptions } from &quot;moleculer&quot;;
+import type { Actions, Events, Meta } from &quot;./contracts&quot;;
+
+export type ActionName = keyof Actions;
+export type ActionParams&lt;N extends ActionName&gt; = Actions[N][&quot;params&quot;];
+export type ActionResult&lt;N extends ActionName&gt; = Actions[N][&quot;result&quot;];
+
+/** A Context whose params/meta are the ones declared for `N`. */
+export type Ctx&lt;N extends ActionName&gt; = Context&lt;ActionParams&lt;N&gt;, Meta&gt;;
+/** Same for event handlers: ctx.params is the event payload. */
+export type EventCtx&lt;E extends keyof Events&gt; = Context&lt;Events[E], Meta&gt;;
+
+export function call&lt;N extends ActionName&gt;(
+  caller: ServiceBroker | Context&lt;unknown, Meta&gt;,
+  action: N,
+  params: ActionParams&lt;N&gt;,
+  opts?: CallingOptions,
+): Promise&lt;ActionResult&lt;N&gt;&gt; {
+  return caller.call&lt;ActionResult&lt;N&gt;, ActionParams&lt;N&gt;&gt;(action, params, opts);
+}
+
+export function emit&lt;E extends keyof Events&gt;(ctx: Context&lt;unknown, Meta&gt;, event: E, payload: Events[E]) {
+  return ctx.emit(event, payload);
+}
+</code></pre>
+<p>This is the whole trick. Everything else in the article builds on it.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/03-moleculer-with-typescript/diagram-types.png" alt="Types are shared through a file, not through the wire. Runtime validation guards the boundary."></p>
+<h2>Step 2: a service in schema style</h2>
+<p>The schema object is Moleculer&#39;s native idiom. In TypeScript you annotate it as <code>ServiceSchema&lt;Settings, Methods&gt;</code>, and <code>this.settings.currency</code> and <code>this.findOrFail()</code> become type-checked inside handlers.</p>
+<pre><code class="language-ts">// services/products.service.ts
+import type { ServiceSchema, Context } from &quot;moleculer&quot;;
+import type { Product, Meta } from &quot;../src/contracts&quot;;
+
+interface Settings { currency: string; }
+interface Methods { findOrFail(id: number): Product; }
+
+const catalogue: Product[] = [
+  { id: 1, name: &quot;Keyboard&quot;, price: 79 },
+  { id: 2, name: &quot;Monitor&quot;, price: 329 },
+  { id: 3, name: &quot;Cable&quot;, price: 9 },
+];
+
+const ProductsService: ServiceSchema&lt;Settings, Methods&gt; = {
+  name: &quot;products&quot;,
+  settings: { currency: &quot;EUR&quot; },
+
+  actions: {
+    get: {
+      // Runtime validation — the compiler cannot check what arrives over the wire.
+      params: { id: { type: &quot;number&quot;, convert: true } },
+      handler(ctx: Context&lt;{ id: number }, Meta&gt;): Product {
+        this.logger.info(`get #${ctx.params.id} for user ${ctx.meta.userId ?? &quot;anonymous&quot;}`);
+        return this.findOrFail(ctx.params.id);          // typed via Methods
+      },
+    },
+    list: {
+      params: { limit: { type: &quot;number&quot;, optional: true, convert: true } },
+      handler(ctx: Context&lt;{ limit?: number }, Meta&gt;): Product[] {
+        return catalogue.slice(0, ctx.params.limit ?? catalogue.length);
+      },
+    },
+  },
+
+  methods: {
+    findOrFail(id) {
+      const p = catalogue.find(p =&gt; p.id === id);
+      if (!p) throw new Error(`Product ${id} not found`);
+      return p;
+    },
+  },
+
+  started() {
+    this.logger.info(`products up, prices in ${this.settings.currency}`);   // typed via Settings
+  },
+};
+
+export default ProductsService;
+</code></pre>
+<p>Two things to notice. The <code>params</code> block is <strong>runtime</strong> validation (Moleculer uses <a href="https://github.com/icebob/fastest-validator">fastest-validator</a>) and it stays there no matter how much TypeScript you add — the compiler has no idea what another process will send. And the <code>Context&lt;{ id: number }, Meta&gt;</code> annotation on the handler is what makes <code>ctx.params.id</code> a <code>number</code> rather than <code>unknown</code>; you could use the <code>Ctx&lt;&quot;products.get&quot;&gt;</code> alias from the wrapper instead, which is what the next service does.</p>
+<h2>Step 3: a service in class style</h2>
+<p>If your team thinks in classes, extend <code>Service</code> and pass the schema from the constructor. Handlers are plain methods, <code>this</code> is the class, and private state is a field.</p>
+<pre><code class="language-ts">// services/orders.service.ts
+import { Service, ServiceBroker } from &quot;moleculer&quot;;
+import type { Order } from &quot;../src/contracts&quot;;
+import { call, emit, type Ctx, type EventCtx } from &quot;../src/typed-broker&quot;;
+
+export default class OrdersService extends Service {
+  private orders: Order[] = [];
+
+  constructor(broker: ServiceBroker) {
+    super(broker);
+    this.parseServiceSchema({
+      name: &quot;orders&quot;,
+      actions: {
+        create: {
+          params: {
+            productId: { type: &quot;number&quot;, convert: true },
+            quantity: { type: &quot;number&quot;, min: 1, convert: true },
+          },
+          handler: this.create,
+        },
+      },
+      events: {
+        &quot;order.created&quot;: this.onOrderCreated,
+      },
+    });
+  }
+
+  async create(ctx: Ctx&lt;&quot;orders.create&quot;&gt;): Promise&lt;Order&gt; {
+    // Typed call: the action name autocompletes, params are checked, the result is a Product.
+    const product = await call(ctx, &quot;products.get&quot;, { id: ctx.params.productId });
+
+    const order: Order = {
+      id: `ord_${this.orders.length + 1}`,
+      productId: product.id,
+      quantity: ctx.params.quantity,
+      total: product.price * ctx.params.quantity,
+    };
+    this.orders.push(order);
+
+    await emit(ctx, &quot;order.created&quot;, order);   // payload must be an Order
+    return order;
+  }
+
+  onOrderCreated(ctx: EventCtx&lt;&quot;order.created&quot;&gt;) {
+    this.logger.info(`event: order ${ctx.params.id} created, total ${ctx.params.total}`);
+  }
+}
+</code></pre>
+<p>Moleculer binds handlers to the service instance, so passing <code>this.create</code> as the handler is fine — inside it, <code>this.orders</code> and <code>this.logger</code> are what you expect.</p>
+<h2>Step 4: a typed caller</h2>
+<pre><code class="language-ts">// src/client.ts
+import { ServiceBroker } from &quot;moleculer&quot;;
+import { call } from &quot;./typed-broker&quot;;
+
+const broker = new ServiceBroker({
+  nodeID: `client-${process.pid}`,
+  transporter: { type: &quot;NATS&quot;, options: { url: &quot;nats://localhost:4222&quot; } },
+  logger: false,
+});
+
+async function main() {
+  await broker.start();
+  await broker.waitForServices([&quot;products&quot;, &quot;orders&quot;]);
+
+  const product = await call(broker, &quot;products.get&quot;, { id: 2 });
+  console.log(&quot;product:&quot;, product.name, product.price);        // product: Product
+
+  const order = await call(broker, &quot;orders.create&quot;, { productId: 2, quantity: 3 });
+  console.log(&quot;order:&quot;, order.id, &quot;total&quot;, order.total);       // order: Order
+
+  // Runtime validation still guards the wire: force a bad payload past the compiler.
+  try {
+    await call(broker, &quot;products.get&quot;, { id: &quot;two&quot; as unknown as number });
+  } catch (err: any) {
+    console.log(&quot;rejected:&quot;, err.name, &quot;-&quot;, err.data?.[0]?.message);
+  }
+
+  await broker.stop();
+}
+main();
+</code></pre>
+<p>And here is what the compiler says when you get it wrong — this is the payoff of the contract file:</p>
+<pre><code class="language-ts">await call(broker, &quot;products.get&quot;, { id: &quot;2&quot; });     // wrong param type
+await call(broker, &quot;product.get&quot;, { id: 2 });        // typo in the action name
+const order = await call(broker, &quot;orders.create&quot;, { productId: 2, quantity: 1 });
+console.log(order.totl);                             // typo in a result field
+</code></pre>
+<pre><code>$ npx tsc --noEmit -p .
+src/mistakes.ts(8,40): error TS2322: Type &#39;string&#39; is not assignable to type &#39;number&#39;.
+src/mistakes.ts(9,22): error TS2345: Argument of type &#39;&quot;product.get&quot;&#39; is not assignable to parameter of type &#39;keyof Actions&#39;.
+src/mistakes.ts(11,21): error TS2551: Property &#39;totl&#39; does not exist on type &#39;Order&#39;. Did you mean &#39;total&#39;?
+</code></pre>
+<p>Three classes of bug that used to be runtime failures in another process are now red squiggles in the editor.</p>
+<h2>Step 5: running it</h2>
+<p><strong>Development:</strong> run the <code>.ts</code> sources directly. <code>moleculer-runner</code> resolves <code>.ts</code> config and service files; it just needs a loader in the process, and <code>tsx</code> is the least fuss:</p>
+<pre><code class="language-ts">// moleculer.config.ts
+import type { BrokerOptions } from &quot;moleculer&quot;;
+
+const config: BrokerOptions = {
+  nodeID: `node-${process.pid}`,
+  transporter: { type: &quot;NATS&quot;, options: { url: process.env.TRANSPORTER ?? &quot;nats://localhost:4222&quot; } },
+  logger: { type: &quot;Console&quot;, options: { formatter: &quot;short&quot; } },
+  requestTimeout: 2000,
+};
+export default config;
+</code></pre>
+<pre><code>$ node --import tsx node_modules/.bin/moleculer-runner --config moleculer.config.ts --mask &quot;**/*.service.ts&quot; services
+[17:49:58.859Z] INFO  PRODUCTS: products up, prices in EUR
+[17:49:58.868Z] INFO  REGISTRY: &#39;orders&#39; service is registered.
+[17:49:58.869Z] INFO  REGISTRY: &#39;products&#39; service is registered.
+[17:49:58.870Z] INFO  BROKER: ✔ ServiceBroker with 3 service(s) started successfully in 869ms.
+
+$ npx tsx src/client.ts
+product: Monitor 329
+order: ord_1 total 987
+rejected: ValidationError - The &#39;id&#39; field must be a number.
+</code></pre>
+<p>The <code>--mask</code> matters: the runner&#39;s default file mask is <code>**/*.service.js</code>, so without it your <code>.ts</code> services are silently skipped.</p>
+<p><strong>Production:</strong> compile once, ship JavaScript, run with plain Node. No loader in the hot path.</p>
+<pre><code>$ npx tsc -p .
+$ node node_modules/.bin/moleculer-runner --config dist/moleculer.config.js dist/services
+$ node dist/src/client.js
+product: Monitor 329
+order: ord_1 total 987
+rejected: ValidationError - The &#39;id&#39; field must be a number.
+</code></pre>
+<p>Same output, same services. In Docker this is a two-stage build: <code>tsc</code> in the first stage, only <code>dist/</code> and production dependencies in the second.</p>
+<h2>The honest caveats</h2>
+<p><strong>1. No decorators in core.</strong> If you want <code>@Action()</code> / <code>@Event()</code> on class methods, the community package <code>moleculer-decorators</code> does it. I tested version 1.3.0 against Moleculer 0.15.2 and it works:</p>
+<pre><code class="language-ts">import { ServiceBroker, Context, Service as MoleculerService } from &quot;moleculer&quot;;
+import { Service, Action, Event, Method } from &quot;moleculer-decorators&quot;;
+
+@Service({ name: &quot;greeter&quot;, settings: { greeting: &quot;Hello&quot; } })
+class GreeterService extends MoleculerService&lt;{ greeting: string }&gt; {
+  @Action({ params: { name: &quot;string&quot; } })
+  hello(ctx: Context&lt;{ name: string }&gt;) {
+    return this.format(ctx.params.name);
+  }
+
+  @Method
+  format(name: string) {
+    return `${this.settings.greeting}, ${name}!`;
+  }
+
+  @Event()
+  &quot;user.signup&quot;(ctx: Context&lt;{ name: string }&gt;) {
+    this.logger.info(`welcome mail to ${ctx.params.name}`);
+  }
+}
+</code></pre>
+<pre><code>$ npx tsx greeter.service.ts
+Hello, Ada!
+</code></pre>
+<p>But be aware of what you&#39;re taking on: the package&#39;s last release was in 2022, it declares a dependency on Moleculer 0.14, and it uses the legacy <code>experimentalDecorators</code> flag rather than the standard (TC39) decorators that TypeScript 5+ supports. It is small and readable, so forking it is a realistic fallback — but it is not maintained by the core team, and I won&#39;t pretend otherwise. If decorators are a hard requirement for your team, weigh that.</p>
+<p><strong>2. Types don&#39;t cross the wire.</strong> The <code>Actions</code> interface is a promise you make to yourself. If the <code>products</code> service is deployed with a new field and the caller isn&#39;t, the compiler is happy and the runtime is what it is. Keep the contract file in a shared package (or a monorepo) and version it with the services. Runtime <code>params</code> validation stays mandatory — it is the only thing that checks what actually arrived.</p>
+<p><strong>3. Some option types are stricter than the runtime.</strong> Example you&#39;ll hit in the first five minutes: <code>transporter: &quot;nats://localhost:4222&quot;</code> is the documented shorthand and works at runtime, but <code>BrokerOptions[&quot;transporter&quot;]</code> doesn&#39;t accept an arbitrary string, so under <code>strict</code> you&#39;ll get a type error. Use the object form <code>{ type: &quot;NATS&quot;, options: { url } }</code>, which is better anyway once you have more than one option. Expect a handful of these; the typings are hand-written and improve release by release (0.15 reworked them — <code>this</code> is typed in lifecycle handlers, for instance), and pull requests to them are the easiest way to contribute to the project.</p>
+<p><strong>4. No dependency injection.</strong> Moleculer has mixins for shared behaviour and <code>this.broker</code> for reaching other services, not a DI container. If your architecture leans on injectable providers and testing through container overrides, that&#39;s a real difference — see the NestJS comparison for when it matters.</p>
+<p><strong>5. <code>this</code> typing depends on you.</strong> Inside a schema, <code>this</code> is only as typed as the generics you pass to <code>ServiceSchema</code>. Skip them and <code>this.settings.anything</code> is <code>any</code>. It&#39;s a small discipline, but it is a discipline.</p>
+<h2>Recommendations</h2>
+<ul>
+<li>Start with the <strong>contract file + typed wrapper</strong>. It&#39;s the highest-value 50 lines in a Moleculer TypeScript project and it works with either service style.</li>
+<li>Use <strong>schema style</strong> by default; it matches the docs and every example on the internet. Use <strong>class style</strong> when a service has enough private state and helpers that a class reads better.</li>
+<li>Use <code>Ctx&lt;&quot;action.name&quot;&gt;</code> for handler signatures so the params type is defined once, in the contract, not repeated per handler.</li>
+<li><code>tsx</code> in development, <code>tsc</code> → <code>dist/</code> in production. Don&#39;t ship a TypeScript loader to prod.</li>
+<li>Keep <code>strict: true</code> and <code>skipLibCheck: true</code> — the second one saves you from type-checking your entire <code>node_modules</code> on every build.</li>
+</ul>
+<p>If you already have a JavaScript Moleculer project, none of this requires a rewrite: rename a file to <code>.ts</code>, add the contract for the actions it calls, and go one service at a time.</p>
+<hr>
+<p><em>Code in this article was compiled with TypeScript 7.0 (<code>strict: true</code>) and run on Moleculer 0.15.2, Node.js 22 and NATS 2. The full example, including a <code>run.sh</code> that exercises both the dev and the production path, is in the <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/03-typescript">moleculer-examples repository</a>.</em></p>
+
+</article>
+</body>
+</html>

@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service discovery and load balancing in Node.js — without Consul or Kubernetes</title>
+<meta name="description" content="Where is the service and which copy do I call? Five live demos: scaling and crashes with traffic running, balancing strategies, and discovery over plain TCP.">
+<style>
+body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
+pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+code { font: 0.9em ui-monospace, Menlo, Consolas, monospace; }
+img { max-width: 100%; }
+blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; color: #555; }
+</style>
+</head>
+<body>
+<article>
+<h1>Service discovery and load balancing in Node.js — without Consul or Kubernetes</h1>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/05-service-discovery-and-load-balancing/hero.jpg" alt="Three lockers labelled WORKER-1, WORKER-2 and WORKER-3, each with its own identical map pinned on the door; WORKER-2 is unplugged with an OFFLINE tag while a dispatcher box with a MOLECULER nameplate hands out parcels"></p>
+<p>The moment you run a service on more than one machine, two questions appear that a monolith never had to answer: <em>where is it</em> (service discovery) and <em>which copy do I call</em> (load balancing). The standard answers are all infrastructure. A registry like Consul or etcd plus a client library in every service. Kubernetes <code>Service</code> objects plus kube-proxy. A service mesh sidecar next to every pod. An nginx or HAProxy in front of every pool.</p>
+<p>Each of these works. Each is also a component you run, monitor, upgrade and get paged for, and none of them knows anything about your application — they see IP addresses and ports, not &quot;the <code>orders.create</code> action, version 2, currently on three nodes&quot;.</p>
+<p>This article shows the other approach: <strong>put the registry in the framework.</strong> Every Node.js process keeps a full copy of the service catalogue, learns about changes directly from its peers, and picks the target of each call locally. No registry server, no sidecar, no extra hop. I&#39;ll use Moleculer, which has done it this way since 2017, and I&#39;ll run every scenario for real — including the one where a node is killed with <code>SIGKILL</code> mid-traffic — so you can see exactly what happens and when.</p>
+<h2>How it works, in one paragraph</h2>
+<p>Each process runs a <strong>service broker</strong> (the Moleculer runtime) with a <strong>node ID</strong>. When a broker starts, it publishes an <code>INFO</code> packet on the <strong>transporter</strong> (the message bus — NATS here, but Redis, MQTT, AMQP, Kafka or plain TCP work the same) describing every service, action and event it hosts, plus free-form metadata. Every other broker receives it and updates its <strong>local registry</strong>. Brokers send a heartbeat every few seconds; a node that stops heartbeating is marked unavailable, and a node that shuts down cleanly says goodbye with a <code>DISCONNECT</code> packet so nobody waits for a timeout. When your code calls <code>broker.call(&quot;greeter.hello&quot;, …)</code>, the <em>caller&#39;s</em> registry picks one live endpoint using a <strong>strategy</strong> and sends the request straight to that node. That is client-side discovery plus client-side load balancing, with the catalogue kept eventually consistent by gossip over the bus.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/05-service-discovery-and-load-balancing/diagram-registry.png" alt="Every node has the full registry; the caller picks the endpoint. No registry server, no proxy hop."></p>
+<h2>The setup</h2>
+<p>One service, deliberately trivial, that reports which node answered:</p>
+<pre><code class="language-js">// services/greeter.service.js — the only service in this article.
+// Every response says which node served it, so load balancing is visible.
+module.exports = {
+  name: &quot;greeter&quot;,
+  actions: {
+    hello: {
+      params: { name: &quot;string&quot; },
+      handler(ctx) {
+        return { hello: ctx.params.name, servedBy: this.broker.nodeID };
+      },
+    },
+  },
+};
+</code></pre>
+<p>One config, shared by every worker process and by the client. Everything the article varies is an environment variable; the service never changes:</p>
+<pre><code class="language-js">// moleculer.config.js
+const PreferZoneStrategy = require(&quot;./prefer-zone.strategy&quot;);   // custom strategy, shown later
+
+// Built-in strategies are picked by name; a custom one is passed as a class.
+const strategy = process.env.STRATEGY === &quot;PreferZone&quot; ? PreferZoneStrategy : process.env.STRATEGY || &quot;RoundRobin&quot;;
+
+module.exports = {
+  nodeID: `worker-${process.pid}`,
+  transporter: process.env.TRANSPORTER || &quot;nats://localhost:4222&quot;,
+  metadata: { zone: process.env.ZONE || &quot;eu&quot; }, // free-form node metadata, visible to every other node
+  registry: {
+    strategy,
+    strategyOptions: { shardKey: &quot;name&quot; }, // only Shard reads this: route by ctx.params.name
+    preferLocal: true,
+  },
+  heartbeatInterval: 2, // seconds; default 10
+  heartbeatTimeout: 6,  // seconds; default 30 — shortened so the crash demo fits in a terminal
+};
+</code></pre>
+<p>Workers are started with <code>moleculer-runner</code>, the framework&#39;s CLI host: <code>SERVICEDIR=services npx moleculer-runner --config moleculer.config.js</code>. The client is a broker with <strong>no services</strong>, which is a perfectly normal thing to be — an API gateway or a cron job looks exactly like this:</p>
+<pre><code class="language-js">// client.js (abridged) — a node with no services of its own; it only calls greeter.hello.
+const broker = new ServiceBroker({ ...config, nodeID: `client-${process.pid}` });
+await broker.start();
+await broker.waitForServices(&quot;greeter&quot;);            // block until at least one instance is known
+
+for (const name of [&quot;ada&quot;, &quot;linus&quot;, &quot;grace&quot;, &quot;dennis&quot;, &quot;ken&quot;, &quot;brian&quot;]) {
+  const res = await broker.call(&quot;greeter.hello&quot;, { name });
+  console.log(`${name.padEnd(7)} → ${res.servedBy}`);
+}
+</code></pre>
+<h2>1. Three workers, zero configuration</h2>
+<p>Start three workers and run the client:</p>
+<pre><code>$ node client.js calls 6
+ada     → worker-3473401
+linus   → worker-3473403
+grace   → worker-3473402
+dennis  → worker-3473401
+ken     → worker-3473403
+brian   → worker-3473402
+</code></pre>
+<p>Round-robin across three processes. Nobody registered anything anywhere; the workers announced themselves on the bus and the client&#39;s registry did the rest. You can ask any node what it currently knows — the registry is exposed as a built-in <code>$node</code> service:</p>
+<pre><code class="language-js">const nodes = await broker.call(&quot;$node.list&quot;, { withServices: true });
+</code></pre>
+<pre><code>$ node client.js nodes
+client-3473436     available=true  zone=eu  services=-
+worker-3473402     available=true  zone=eu  services=greeter
+worker-3473401     available=true  zone=eu  services=greeter
+worker-3473403     available=true  zone=eu  services=greeter
+</code></pre>
+<p>Note the <code>zone=eu</code> column: that&#39;s the <code>metadata</code> from the config, carried in the <code>INFO</code> packet. It will matter in a minute.</p>
+<h2>2. Scaling down, crashing, scaling up — with traffic running</h2>
+<p>This is the part registry vendors don&#39;t put in the quick-start. The client calls <code>greeter.hello</code> every 500 ms for 16 seconds. While it runs, I stop one worker cleanly (<code>SIGTERM</code>), <strong>kill</strong> another (<code>SIGKILL</code>, no goodbye), and start a new one.</p>
+<pre><code>$ node client.js loop 16
+t=  0.0s  → worker-3473034
+t=  0.5s  → worker-3473036
+t=  1.0s  → worker-3473035
+t=  1.5s  → worker-3473034          ← SIGTERM sent to worker-3473034 right after this
+t=  2.1s  → worker-3473036
+t=  2.6s  → worker-3473036
+t=  3.1s  → worker-3473035
+t=  3.6s  → worker-3473036
+t=  4.1s  → worker-3473035
+t=  4.6s  → worker-3473036
+t=  5.1s  → worker-3473035
+t=  5.6s  → worker-3473036          ← SIGKILL sent to worker-3473035 here
+[20:45:57.784Z] WARN  BROKER: Request &#39;greeter.hello&#39; is timed out. { nodeID: &#39;worker-3473035&#39;, timeout: 2000 }
+t=  6.2s  ✗ RequestTimeoutError: Request is timed out when call &#39;greeter.hello&#39; action on &#39;worker-3473035&#39; node.
+t=  8.7s  → worker-3473036
+[20:46:00.807Z] WARN  BROKER: Request &#39;greeter.hello&#39; is timed out. { nodeID: &#39;worker-3473035&#39;, timeout: 2000 }
+t=  9.2s  ✗ RequestTimeoutError: Request is timed out when call &#39;greeter.hello&#39; action on &#39;worker-3473035&#39; node.
+t= 11.7s  → worker-3473036
+[20:46:01.618Z] WARN  DISCOVERY: Heartbeat is not received from &#39;worker-3473035&#39; node.
+[20:46:01.619Z] WARN  REGISTRY: Node &#39;worker-3473035&#39; disconnected unexpectedly.
+t= 12.2s  → worker-3473036
+t= 12.7s  → worker-3473036
+t= 13.3s  → worker-3473036
+t= 13.8s  → worker-3473098          ← new worker, first request within a second of starting
+t= 14.3s  → worker-3473036
+t= 14.8s  → worker-3473098
+</code></pre>
+<p>Three different things happened, and it&#39;s worth being precise about each:</p>
+<ul>
+<li><strong>Graceful stop is instant.</strong> <code>worker-3473034</code> got <code>SIGTERM</code>, the runner stopped the broker, the broker sent <code>DISCONNECT</code>, and the node was gone from every registry before the next call. Zero failed requests. This is what happens on every deploy, so it&#39;s the case that matters most.</li>
+<li><strong>A crash is detected by heartbeat, and until then calls to that node fail.</strong> <code>worker-3473035</code> was killed at ~5.6 s. The registry only learned at ~11.6 s (<code>heartbeatTimeout: 6</code>), and in between, every request round-robined onto the dead node timed out. That&#39;s two failures out of eight calls. With the default <code>heartbeatTimeout: 30</code> it would have been worse. <strong>No client-side registry can do better than its heartbeat window</strong> — Consul&#39;s agent has the same gap, Kubernetes&#39; readiness probes have the same gap — the difference is only who notices and how you react. Reacting is what retries and circuit breakers are for; that&#39;s the next article. For now: tune <code>heartbeatInterval</code>/<code>heartbeatTimeout</code> to what your deployment can afford (2/6 is fine for a dozen nodes; the defaults are conservative for hundreds).</li>
+<li><strong>Scaling up is sub-second.</strong> <code>worker-3473098</code> started, published <code>INFO</code>, and was serving traffic on the next tick. No registration step, no health-check grace period, no DNS TTL.</li>
+</ul>
+<h2>3. Choosing who gets the call: strategies</h2>
+<p>Round-robin is the default, but the strategy is a one-word option. Built in:</p>
+<ul>
+<li><strong>RoundRobin</strong> — the default; equal share, in order.</li>
+<li><strong>Random</strong> — equal share, no order; useful when many callers would otherwise stay in lockstep.</li>
+<li><strong>CpuUsage</strong> — samples the CPU load nodes report in their heartbeat, picks a lightly loaded one. Good for uneven hardware.</li>
+<li><strong>Latency</strong> — measures round-trip time to each node and prefers the fast ones. Good for multi-region.</li>
+<li><strong>Shard</strong> — consistent hashing on a field from the request, so the same key always lands on the same node. This is how you get in-memory per-user caches or ordered processing per key without a separate sticky-session layer.</li>
+</ul>
+<p>Shard, keyed on <code>name</code>, same three workers:</p>
+<pre><code>$ STRATEGY=Shard node client.js calls 12
+ada     → worker-3473403
+linus   → worker-3473403
+grace   → worker-3473471
+dennis  → worker-3473471
+ken     → worker-3473471
+brian   → worker-3473471
+ada     → worker-3473403
+linus   → worker-3473403
+grace   → worker-3473471
+dennis  → worker-3473471
+ken     → worker-3473471
+brian   → worker-3473471
+</code></pre>
+<p>Same name, same node, every time — with a consistent-hash ring, so adding a node only moves the keys that land on it. Two things I learned while writing this: the key must be given as <code>registry.strategyOptions.shardKey</code> (I first tried <code>strategy: { type: &quot;Shard&quot;, options: {…} }</code>, which is silently ignored and falls back to random selection — check the output, not the config), and the key can be read from <code>ctx.meta</code> instead of params with a <code>#</code> prefix (<code>&quot;#userId&quot;</code>), which is usually what you want since the user ID rides in <code>meta</code>. Strategies can also be set <strong>per action</strong> (<code>strategy</code>/<code>strategyOptions</code> on the action definition) if one hot action needs sharding and the rest don&#39;t.</p>
+<h3>Writing your own in fifteen lines</h3>
+<p>The strategy interface is one method: <code>select(endpoints, ctx)</code>. Here&#39;s one that keeps traffic inside the caller&#39;s own zone when it can, and falls back to everything when it can&#39;t — the classic &quot;same-AZ first&quot; rule, without a mesh:</p>
+<pre><code class="language-js">// prefer-zone.strategy.js — a custom load-balancing strategy in ~15 lines.
+// Picks an instance in the caller&#39;s own zone when one is alive; falls back to any instance.
+const { Strategies } = require(&quot;moleculer&quot;);
+
+class PreferZoneStrategy extends Strategies.Base {
+  constructor(registry, broker, opts) {
+    super(registry, broker, opts);
+    this.zone = broker.metadata.zone;
+    this.fallback = new Strategies.RoundRobin(registry, broker, opts);
+  }
+
+  select(endpoints, ctx) {
+    const local = endpoints.filter((ep) =&gt; ep.node.metadata?.zone === this.zone);
+    return this.fallback.select(local.length ? local : endpoints, ctx);
+  }
+}
+
+module.exports = PreferZoneStrategy;
+</code></pre>
+<p>Add a fourth worker with <code>ZONE=us</code>, then call from three different places:</p>
+<pre><code>$ node client.js nodes
+worker-3473488     available=true  zone=us  services=greeter
+worker-3473471     available=true  zone=eu  services=greeter
+worker-3473403     available=true  zone=eu  services=greeter
+
+$ STRATEGY=PreferZone ZONE=eu node client.js calls 6
+ada     → worker-3473471
+linus   → worker-3473403
+grace   → worker-3473471
+dennis  → worker-3473403
+ken     → worker-3473471
+brian   → worker-3473403
+
+$ STRATEGY=PreferZone ZONE=us node client.js calls 6
+ada     → worker-3473488
+linus   → worker-3473488
+grace   → worker-3473488
+dennis  → worker-3473488
+ken     → worker-3473488
+brian   → worker-3473488
+
+$ STRATEGY=PreferZone ZONE=asia node client.js calls 6      # no local instance → fall back to all
+ada     → worker-3473403
+linus   → worker-3473471
+grace   → worker-3473488
+dennis  → worker-3473403
+ken     → worker-3473471
+brian   → worker-3473488
+</code></pre>
+<p>The <code>eu</code> caller round-robins over the two <code>eu</code> workers, the <code>us</code> caller pins to its one <code>us</code> worker, and a caller from a zone with no workers uses all three. The metadata came from the registry — the strategy never made a network call. You can put anything in <code>metadata</code>: version, hardware class, canary flag, tenant — and route on it the same way.</p>
+<h3>One more rule you get for free: <code>preferLocal</code></h3>
+<p>If the calling node <em>itself</em> hosts an instance of the service, <code>preferLocal: true</code> (the default) calls it in-process and skips the network entirely. That&#39;s what lets the same code run as a modular monolith on a laptop and as a distributed system in production — I showed that end-to-end in the previous article.</p>
+<h2>4. No message broker either: discovery over plain TCP</h2>
+<p>Everything above used NATS as the bus. If you don&#39;t want to run even that — a small deployment, an on-prem box, an edge device — Moleculer&#39;s <strong>TCP transporter</strong> has discovery built in: nodes find each other by UDP multicast and then talk over direct TCP connections. Same two workers, same client, one variable changed:</p>
+<pre><code>$ TRANSPORTER=TCP SERVICEDIR=services npx moleculer-runner --config moleculer.config.js
+[20:47:29.966Z] INFO  TRANSPORTER: TCP server is listening on port 42799
+[20:47:29.971Z] INFO  TRANSPORTER: UDP Multicast Server is listening on 192.168.1.20:4445. Membership: 239.0.0.0
+[20:47:29.972Z] INFO  TRANSPORTER: UDP discovery started.
+
+$ TRANSPORTER=TCP node client.js calls 4
+ada     → worker-3473535
+linus   → worker-3473536
+grace   → worker-3473535
+dennis  → worker-3473536
+</code></pre>
+<p>(IP address replaced; everything else is the actual log.) Service discovery and load balancing with <strong>no infrastructure process at all</strong> — not a registry, not a bus. The honest limitation: most cloud networks block multicast between VMs, so across hosts on AWS/GCP/Azure you either give the TCP transporter a static <code>urls</code> list of peers, or you use NATS/Redis, which is what I&#39;d do anyway once there&#39;s more than one host.</p>
+<h2>When you still want Consul or Kubernetes</h2>
+<p>Being fair about the boundaries:</p>
+<ul>
+<li><strong>Polyglot systems.</strong> The registry lives in the Node.js processes. A Go or Python service can&#39;t join it (there are <a href="https://github.com/moleculer-java/moleculer-java">Java</a> and <a href="https://github.com/moleculer-go/moleculer">Go</a> ports that speak the same protocol, but they&#39;re separate community projects). If half your services aren&#39;t Node, an external registry is the lingua franca.</li>
+<li><strong>You&#39;re already on Kubernetes.</strong> Then keep it — for scheduling, restarts, secrets and ingress, it&#39;s excellent. It doesn&#39;t conflict: Kubernetes decides <em>which pods exist</em>, the broker&#39;s registry decides <em>which action call goes to which pod</em> and does so with application-level knowledge (versions, metadata, per-action strategies) that a <code>Service</code> object doesn&#39;t have. Many teams run exactly this combination, and it means the same code also runs on a plain VM.</li>
+<li><strong>Very large clusters.</strong> Every node hearing every heartbeat is O(n²) chatter. Past a few hundred nodes, switch the <strong>discoverer</strong> from the default gossip to the Redis- or etcd-backed one (<code>registry.discoverer: &quot;Redis&quot;</code>) — heartbeats go to a shared store instead of the bus. That&#39;s one config line, and the rest of the article is unchanged.</li>
+</ul>
+<p>For a Node.js system of, say, five to fifty services on a handful of machines — which is most systems — the registry in the framework covers service discovery, load balancing, zone affinity, sharding and node health, and the only infrastructure you ran for it in this article was one NATS container. Or, in the last demo, nothing.</p>
+<hr>
+<p><em>Code in this article was run on Moleculer 0.15.2 and Node.js 22, with NATS 2 as the bus except in the TCP section. The <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/05-service-discovery-and-load-balancing">moleculer-examples repository</a> has a <code>run.sh</code> that reproduces all five demos, including the crash-and-recover timeline.</em></p>
+
+</article>
+</body>
+</html>

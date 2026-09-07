@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moleculer vs NestJS: which one, and when</title>
+<meta name="description" content="The same service written in both frameworks, what each one does when you add a second instance, and a decision list instead of a sales pitch.">
+<style>
+body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
+pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+code { font: 0.9em ui-monospace, Menlo, Consolas, monospace; }
+img { max-width: 100%; }
+blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; color: #555; }
+</style>
+</head>
+<body>
+<article>
+<h1>Moleculer vs NestJS: which one, and when</h1>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/02-moleculer-vs-nestjs/hero.jpg" alt="Two equally well-kept toolboxes side by side: NESTJS with neat compartments labelled CONTROLLERS, MODULES and GUARDS; MOLECULER with three wired modules labelled PRODUCTS-1, PRODUCTS-2 and GATEWAY"></p>
+<p>If you are choosing a framework for a Node.js backend that will be more than one service, you will end up comparing NestJS and Moleculer. People ask me about it constantly, usually phrased as &quot;which is better?&quot;, and I maintain one of them, so you would expect a sales pitch.</p>
+<p>You are not getting one. NestJS and Moleculer solve different problems and overlap in the middle, and the honest answer is that most teams should pick based on which problem they actually have. This article lays out the difference, shows the same service written in both, and ends with a decision list I would actually stand behind.</p>
+<h2>First, what each one is</h2>
+<p><strong>NestJS</strong> is an application framework. It gives a Node.js codebase structure: modules, dependency injection, decorators, guards, pipes, interceptors, and a CLI that scaffolds all of it. It is TypeScript-first and Angular-shaped, and it has integrations for nearly everything — REST, GraphQL, WebSockets, Swagger, task scheduling, caching, queues. Its <code>@nestjs/microservices</code> package lets a Nest app listen on a message transport (TCP, Redis, NATS, MQTT, RabbitMQ, Kafka, gRPC) instead of HTTP, and call other apps over it.</p>
+<p><strong>Moleculer</strong> is a microservices framework. Its core concern is the <em>distributed-systems layer</em>: a service registry with discovery, load balancing between instances, request/response and pub/sub messaging over a pluggable transporter, and resilience — timeouts, retries, circuit breaker, bulkhead, fallbacks — built into every call. It also has caching, parameter validation, metrics and distributed tracing as broker options. It is less opinionated about how you structure the code <em>inside</em> a service: a service is a plain object with actions and event handlers.</p>
+<p>The overlap is &quot;several Node.js processes talking to each other over NATS&quot;. The difference is what each framework takes responsibility for once they do.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/02-moleculer-vs-nestjs/diagram-scope.png" alt="What comes in the box: NestJS owns application structure; Moleculer owns the service layer."></p>
+<h2>The same service, twice</h2>
+<p>Let&#39;s build the smallest realistic thing: a <code>products</code> service that runs as its own process, behind an HTTP gateway, with two instances for redundancy. Both versions use NATS. All of the code below runs as shown — Node 22, NestJS 12, Moleculer 0.15.</p>
+<h3>NestJS</h3>
+<p>The service is a controller with a message pattern, bootstrapped as a microservice. The <code>queue</code> option puts every instance in the same NATS queue group, which is what gives you load balancing.</p>
+<pre><code class="language-ts">// nest/products.service.ts — a NestJS &quot;microservice&quot;: a NATS listener with message patterns.
+import &quot;reflect-metadata&quot;;
+import { Controller, Module } from &quot;@nestjs/common&quot;;
+import { NestFactory } from &quot;@nestjs/core&quot;;
+import { MessagePattern, Payload, Transport, MicroserviceOptions } from &quot;@nestjs/microservices&quot;;
+
+@Controller()
+class ProductsController {
+  @MessagePattern(&quot;products.get&quot;)
+  get(@Payload() data: { id: number }) {
+    return { id: data.id, name: `Product #${data.id}`, price: 42, servedBy: `products-${process.pid}` };
+  }
+}
+
+@Module({ controllers: [ProductsController] })
+class ProductsModule {}
+
+async function bootstrap() {
+  const app = await NestFactory.createMicroservice&lt;MicroserviceOptions&gt;(ProductsModule, {
+    transport: Transport.NATS,
+    options: { servers: [&quot;nats://localhost:4222&quot;], queue: &quot;products&quot; }, // queue group = load balancing
+  });
+  await app.listen();
+  console.log(`products microservice up (pid ${process.pid})`);
+}
+bootstrap();
+</code></pre>
+<p>The gateway is an ordinary Nest HTTP app with a <code>ClientProxy</code> injected. Note the two things you have to do yourself: convert the URL parameter with a pipe, and put a timeout on the call with RxJS.</p>
+<pre><code class="language-ts">// nest/gateway.ts — a NestJS HTTP app that calls the products microservice over NATS.
+import &quot;reflect-metadata&quot;;
+import { Controller, Get, Module, Param, ParseIntPipe } from &quot;@nestjs/common&quot;;
+import { NestFactory } from &quot;@nestjs/core&quot;;
+import { ClientsModule, ClientProxy, Transport } from &quot;@nestjs/microservices&quot;;
+import { Inject } from &quot;@nestjs/common&quot;;
+import { firstValueFrom, timeout } from &quot;rxjs&quot;;
+
+@Controller(&quot;products&quot;)
+class ProductsGatewayController {
+  constructor(@Inject(&quot;PRODUCTS&quot;) private readonly client: ClientProxy) {}
+
+  @Get(&quot;:id&quot;)
+  get(@Param(&quot;id&quot;, ParseIntPipe) id: number) {
+    // send() returns an Observable; you add timeouts/retries yourself.
+    return firstValueFrom(this.client.send(&quot;products.get&quot;, { id }).pipe(timeout(2000)));
+  }
+}
+
+@Module({
+  imports: [
+    ClientsModule.register([
+      { name: &quot;PRODUCTS&quot;, transport: Transport.NATS, options: { servers: [&quot;nats://localhost:4222&quot;] } },
+    ]),
+  ],
+  controllers: [ProductsGatewayController],
+})
+class GatewayModule {}
+
+async function bootstrap() {
+  const app = await NestFactory.create(GatewayModule, { logger: [&quot;error&quot;, &quot;warn&quot;] });
+  await app.listen(process.env.PORT || 3000);
+  console.log(`gateway on http://localhost:${process.env.PORT || 3000}`);
+}
+bootstrap();
+</code></pre>
+<p>Run two service instances and the gateway, then hit it:</p>
+<pre><code>$ npx tsx nest/products.service.ts &amp;
+$ npx tsx nest/products.service.ts &amp;
+$ npx tsx nest/gateway.ts &amp;
+$ for i in 1 2 3 4; do curl -s localhost:3000/products/$i; echo; done
+{&quot;id&quot;:1,&quot;name&quot;:&quot;Product #1&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3460437&quot;}
+{&quot;id&quot;:2,&quot;name&quot;:&quot;Product #2&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3460417&quot;}
+{&quot;id&quot;:3,&quot;name&quot;:&quot;Product #3&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3460437&quot;}
+{&quot;id&quot;:4,&quot;name&quot;:&quot;Product #4&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3460437&quot;}
+
+$ curl -s localhost:3000/products/abc
+{&quot;message&quot;:&quot;Validation failed (numeric string is expected)&quot;,&quot;error&quot;:&quot;Bad Request&quot;,&quot;statusCode&quot;:400}
+</code></pre>
+<p>Load balancing works (NATS is doing it, not Nest — the queue group hands each message to one subscriber). Validation works because we added <code>ParseIntPipe</code>. Now stop both <code>products</code> processes and call again:</p>
+<pre><code>$ curl -s localhost:3000/products/5
+{&quot;statusCode&quot;:500,&quot;message&quot;:&quot;Internal server error&quot;}
+# gateway log: EmptyResponseException: Empty response. There are no subscribers listening to that message (&quot;products.get&quot;)
+</code></pre>
+<p>Fast failure, which is good — NATS reports &quot;no responders&quot;. But it is a generic 500, there is no retry, no circuit breaker, and nothing in the gateway knows that <code>products</code> exists at all except the string <code>&quot;products.get&quot;</code>.</p>
+<h3>Moleculer</h3>
+<p>The same service as a Moleculer service schema. Validation is declared on the action; <code>convert: true</code> handles the string-from-URL case.</p>
+<pre><code class="language-js">// moleculer/products.service.js — the same service in Moleculer.
+const { ServiceBroker } = require(&quot;moleculer&quot;);
+
+const broker = new ServiceBroker({
+  nodeID: `products-${process.pid}`,
+  transporter: &quot;nats://localhost:4222&quot;,
+  logger: false,
+});
+
+broker.createService({
+  name: &quot;products&quot;,
+  actions: {
+    get: {
+      params: { id: { type: &quot;number&quot;, convert: true } },   // validation is part of the action
+      handler(ctx) {
+        return { id: ctx.params.id, name: `Product #${ctx.params.id}`, price: 42, servedBy: this.broker.nodeID };
+      },
+    },
+  },
+});
+
+broker.start().then(() =&gt; console.log(`products service up (${broker.nodeID})`));
+</code></pre>
+<p>The gateway uses <code>moleculer-web</code>, which is a service that maps HTTP routes to actions. The timeout is a broker option, so it applies to every call in the process.</p>
+<pre><code class="language-js">// moleculer/gateway.js — HTTP edge, mapping a route to the action.
+const { ServiceBroker } = require(&quot;moleculer&quot;);
+const ApiGateway = require(&quot;moleculer-web&quot;);
+
+const broker = new ServiceBroker({
+  nodeID: `gateway-${process.pid}`,
+  transporter: &quot;nats://localhost:4222&quot;,
+  logger: false,
+  requestTimeout: 2000,                       // global; NestJS needs rxjs timeout() per call
+});
+
+broker.createService({
+  name: &quot;api&quot;,
+  mixins: [ApiGateway],
+  settings: {
+    port: process.env.PORT || 3000,
+    routes: [{ path: &quot;/&quot;, aliases: { &quot;GET /products/:id&quot;: &quot;products.get&quot; } }],
+  },
+});
+
+broker.start().then(() =&gt; console.log(`gateway on http://localhost:${process.env.PORT || 3000}`));
+</code></pre>
+<pre><code>$ node moleculer/products.service.js &amp;
+$ node moleculer/products.service.js &amp;
+$ node moleculer/gateway.js &amp;
+$ for i in 1 2 3 4; do curl -s localhost:3000/products/$i; echo; done
+{&quot;id&quot;:1,&quot;name&quot;:&quot;Product #1&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3460597&quot;}
+{&quot;id&quot;:2,&quot;name&quot;:&quot;Product #2&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3460596&quot;}
+{&quot;id&quot;:3,&quot;name&quot;:&quot;Product #3&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3460597&quot;}
+{&quot;id&quot;:4,&quot;name&quot;:&quot;Product #4&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3460596&quot;}
+
+$ curl -s localhost:3000/products/abc
+{&quot;name&quot;:&quot;ValidationError&quot;,&quot;message&quot;:&quot;Parameters validation error!&quot;,&quot;code&quot;:422,&quot;type&quot;:&quot;VALIDATION_ERROR&quot;,&quot;data&quot;:[{&quot;type&quot;:&quot;number&quot;,&quot;message&quot;:&quot;The &#39;id&#39; field must be a number.&quot;,&quot;field&quot;:&quot;id&quot;,&quot;actual&quot;:&quot;abc&quot;,&quot;nodeID&quot;:&quot;gateway-3460598&quot;,&quot;action&quot;:&quot;products.get&quot;}]}
+
+# stop both products processes, then:
+$ curl -s localhost:3000/products/5
+{&quot;name&quot;:&quot;ServiceNotAvailableError&quot;,&quot;message&quot;:&quot;Service &#39;products.get&#39; is not available.&quot;,&quot;code&quot;:404,&quot;type&quot;:&quot;SERVICE_NOT_AVAILABLE&quot;,&quot;data&quot;:{&quot;action&quot;:&quot;products.get&quot;}}
+</code></pre>
+<p>Here the load balancing is done by Moleculer&#39;s registry (round-robin by default; you can switch to latency-based, CPU-based or sharded). When the service instances went away, the gateway <em>knew</em> — it has a live registry of every node and action in the cluster, updated by heartbeats — and returned a structured, typed error. Add <code>retryPolicy</code> and <code>circuitBreaker</code> to the broker options and you get retries and a breaker on every call with no code changes; the previous article shows both in action.</p>
+<h2>What you would have to add to NestJS</h2>
+<p>If you build a multi-service system on <code>@nestjs/microservices</code>, here is what is <em>not</em> in the box and what people typically bolt on:</p>
+<ul>
+<li><strong>Service registry / discovery</strong> — nothing. You rely on the broker&#39;s semantics (NATS subjects, Kafka topics) or on Kubernetes DNS. There is no way to ask &quot;which services are online, on which nodes?&quot;</li>
+<li><strong>Load balancing</strong> — only what the transport gives you (NATS queue groups, Kafka consumer groups). TCP transport: one address, no balancing.</li>
+<li><strong>Retries, circuit breaker, bulkhead, fallback</strong> — nothing built in. <code>opossum</code>, RxJS <code>retry()</code>, or a service mesh.</li>
+<li><strong>Timeouts</strong> — per call, with RxJS <code>timeout()</code>.</li>
+<li><strong>Payload validation on the message side</strong> — <code>ValidationPipe</code> with <code>class-validator</code> DTOs, same as HTTP.</li>
+<li><strong>Caching of RPC results</strong> — <code>@nestjs/cache-manager</code> on the HTTP side; nothing at the transport level.</li>
+<li><strong>Metrics &amp; tracing across service calls</strong> — community OpenTelemetry packages; you propagate context yourself.</li>
+<li><strong>Local vs remote transparency</strong> — a <code>ClientProxy</code> always goes through the broker, even to a handler in the same process. There is no &quot;start as a monolith, split later&quot; mode.</li>
+</ul>
+<p>None of this is a criticism. NestJS&#39;s microservices package is a <strong>transport abstraction</strong> — it makes a Nest app able to talk over a broker with the same controller idioms as HTTP. That is exactly what it claims to be. It is just not a service layer, and the difference matters a lot once you have ten services and a bad Tuesday.</p>
+<h2>What you would have to add to Moleculer</h2>
+<p>The other direction is just as real:</p>
+<ul>
+<li><strong>TypeScript ergonomics.</strong> Moleculer ships type definitions and works fine in TypeScript, but its native idiom is the schema object, not decorators and classes. Community packages (<code>moleculer-decorators</code>, TypeScript project templates) close some of the gap; the DX is not at NestJS&#39;s level, and I&#39;d rather say that than have you find out later. The 0.15 release invested in typings (typed service lifecycle handlers, middleware, error handlers), and it keeps improving.</li>
+<li><strong>Dependency injection.</strong> Moleculer has mixins and service-level <code>this</code> for shared logic, not a DI container. If your team&#39;s mental model is Angular-style providers, you will miss it.</li>
+<li><strong>Application structure.</strong> Nest&#39;s CLI scaffolds modules, tests and DTOs and enforces a layout. Moleculer has a project generator, but inside a service you organise the code however you like.</li>
+<li><strong>Ecosystem breadth.</strong> NestJS has an official module for nearly every integration. Moleculer has an API gateway, database adapters, channels (queue-based reliable events), Socket.IO, GraphQL — and then you&#39;re writing your own service around an npm client, which is easy but is yours to maintain.</li>
+<li><strong>Community size and hiring.</strong> This is the honest big one. NestJS has ~76k GitHub stars and ~54 million monthly npm downloads; Moleculer has ~6k stars and ~250k downloads. A NestJS job ad gets more applicants who have used it. If you are building a team of twenty, that difference is worth real money.</li>
+</ul>
+<h2>Can you use both?</h2>
+<p>Yes, and it is more common than you&#39;d think. The combinations that work:</p>
+<ul>
+<li><strong>Moleculer as the internal service layer, NestJS at the edge.</strong> Nest handles HTTP with its full toolkit (guards, Swagger, GraphQL), and a Moleculer broker running inside the Nest process calls the services. You get Nest&#39;s DX where users touch the system and Moleculer&#39;s registry, balancing and resilience behind it.</li>
+<li><strong>NestJS everywhere, Moleculer for one hairy subsystem</strong> that needs pub/sub with balanced consumers, sharding or circuit breaking that you don&#39;t want to hand-roll.</li>
+</ul>
+<p>What doesn&#39;t work well is running <em>both</em> frameworks&#39; microservices transports side by side for the same calls — pick one owner for inter-service communication.</p>
+<h2>Which one, and when</h2>
+<p>Pick <strong>NestJS</strong> if:</p>
+<ul>
+<li>You are building one service, or a monolith that might split <em>someday</em>. Most apps are this. Nest is the better single-app framework, full stop.</li>
+<li>Your team is TypeScript-native and values decorators, DI and enforced structure.</li>
+<li>You need the breadth: GraphQL federation, WebSocket gateways, Swagger generation, Passport strategies, all official.</li>
+<li>Hiring and onboarding speed matter more than the distributed-systems layer.</li>
+<li>You already run Kubernetes with a service mesh, so discovery and resilience are the platform&#39;s job.</li>
+</ul>
+<p>Pick <strong>Moleculer</strong> if:</p>
+<ul>
+<li>You are building a system of many services <em>now</em>, and you do not want to assemble discovery, balancing, retries, circuit breakers, caching and tracing from six separate packages.</li>
+<li>You do <strong>not</strong> have Kubernetes or a service mesh and don&#39;t want to run one — Moleculer gives you those properties on a VM with Docker Compose (see Node.js microservices without Kubernetes).</li>
+<li>Your architecture is event-driven — balanced and broadcast events across services, over NATS, Redis, Kafka or MQTT, are first-class.</li>
+<li>You want to start as a modular monolith and split into processes later <em>without changing service code</em>.</li>
+<li>Plain JavaScript is fine, or you&#39;re happy with Moleculer&#39;s level of TypeScript support.</li>
+</ul>
+<p>And if you&#39;re undecided: build the first service in NestJS. If the day comes when you have five of them calling each other and you find yourself writing a retry helper for the third time, that&#39;s the moment to look at Moleculer — and the boundary between the two is clean enough that you can.</p>
+<hr>
+<p><em>Code in this article was run against NestJS 12.0 and Moleculer 0.15.2 on Node.js 22 with NATS 2. The full example project, including scripts that reproduce the outputs above, is in the <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/02-moleculer-vs-nestjs">moleculer-examples repository</a>.</em></p>
+
+</article>
+</body>
+</html>

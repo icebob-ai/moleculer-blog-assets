@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Node.js microservices without Kubernetes (and without a platform team)</title>
+<meta name="description" content="Microservices are a set of capabilities, not a container orchestrator. The same three-service system as one process, as many processes, and scaled — with no Kubernetes anywhere.">
+<style>
+body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
+pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+code { font: 0.9em ui-monospace, Menlo, Consolas, monospace; }
+img { max-width: 100%; }
+blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; color: #555; }
+</style>
+</head>
+<body>
+<article>
+<h1>Node.js microservices without Kubernetes (and without a platform team)</h1>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/01-nodejs-microservices-without-kubernetes/hero.jpg" alt="A small desktop server with a MOLECULER nameplate and three little modules labelled USERS, ORDERS and MAILER plugged into it; through the window behind it, a huge container port with cranes, kept far away"></p>
+<p>Somewhere around 2018 the phrase &quot;we&#39;re doing microservices&quot; silently became &quot;we&#39;re running Kubernetes&quot;. The two ideas fused. Today when a Node.js team asks <em>how</em> to split a backend into services, the answer they get is a shopping list: a cluster, an ingress controller, a service mesh for retries and mTLS, Consul or CoreDNS for discovery, Prometheus and Jaeger wired into sidecars, and a Helm chart per service to hold it all together.</p>
+<p>That stack is excellent. It is also, for most teams that are not Google, the wrong first step. This article is about the other path: getting the actual <em>properties</em> of microservices — independent deployment, service discovery, load balancing, fault isolation, an event bus — in plain Node.js processes, on a single VM or a handful of them, without an orchestrator.</p>
+<p>I maintain <a href="https://moleculer.services">Moleculer</a>, a microservices framework for Node.js and TypeScript that was built for exactly this, so the examples use it. But the argument comes first, and it holds regardless of which tool you pick.</p>
+<h2>What you actually need from &quot;microservices&quot;</h2>
+<p>Strip away the branding and a microservice architecture is a short list of capabilities:</p>
+<ul>
+<li><strong>Service discovery</strong> — service A needs to find a live instance of service B without hardcoding IPs.</li>
+<li><strong>Load balancing</strong> — if B has three instances, calls should spread across them, and a dead instance should stop receiving traffic.</li>
+<li><strong>Inter-service communication</strong> — request/response (RPC) and publish/subscribe (events), with serialization handled for you.</li>
+<li><strong>Resilience</strong> — timeouts, retries, circuit breakers, bulkheads and fallbacks so one slow dependency doesn&#39;t take the whole system down.</li>
+<li><strong>Observability</strong> — metrics and distributed tracing across service boundaries.</li>
+<li><strong>Independent deployment</strong> — ship service B without redeploying A.</li>
+</ul>
+<p>Kubernetes plus a service mesh gives you all of that at the <em>infrastructure</em> level: discovery via DNS and Services, balancing via kube-proxy or Envoy, resilience via Istio/Linkerd policies, tracing via sidecars. It is a legitimate design. It&#39;s just a lot of moving parts, and every one of them is something your team has to run, upgrade and debug at 3am.</p>
+<p>The alternative is to put those capabilities in the <em>application</em> layer — in a library your services import — and let the infrastructure be as dumb as a VM with Docker Compose. That&#39;s the Moleculer model.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/01-nodejs-microservices-without-kubernetes/diagram-layers.png" alt="Where the six capabilities live: in the platform, or in the framework."></p>
+<h2>Moleculer in sixty seconds</h2>
+<p>A few terms, each glossed with what you&#39;d type into a search box:</p>
+<ul>
+<li><strong>ServiceBroker</strong> — the runtime and service registry that lives in every process. It knows which services exist, where they are, and routes calls to them.</li>
+<li><strong>Service</strong> — a named object with <strong>actions</strong> (RPC endpoints, callable as <code>&quot;orders.create&quot;</code>) and <strong>event handlers</strong> (subscribers).</li>
+<li><strong>Transporter</strong> — the message broker / transport layer between processes: NATS, Redis, Kafka, MQTT, AMQP or plain TCP. Swappable with one config line.</li>
+</ul>
+<p>The crucial property: a service&#39;s code does not know whether the service it&#39;s calling is in the same process or on another machine. <code>ctx.call(&quot;products.get&quot;)</code> is the same line either way.</p>
+<h2>Step 1: three services, one process</h2>
+<p>Let&#39;s write a tiny shop: <code>products</code>, <code>orders</code> and <code>notifications</code>. Here is the business logic, and note that this file <strong>never changes</strong> for the rest of the article.</p>
+<pre><code class="language-js">// services.js — the business logic. It never changes between &quot;one process&quot; and &quot;many processes&quot;.
+
+const Products = {
+  name: &quot;products&quot;,
+  actions: {
+    get: {
+      params: { id: { type: &quot;number&quot;, convert: true } }, // convert: URL params arrive as strings
+      handler(ctx) {
+        return { id: ctx.params.id, name: `Product #${ctx.params.id}`, price: 42, servedBy: this.broker.nodeID };
+      },
+    },
+  },
+};
+
+const Orders = {
+  name: &quot;orders&quot;,
+  actions: {
+    create: {
+      params: { productId: &quot;number&quot;, qty: &quot;number&quot; },
+      async handler(ctx) {
+        // Looks like a local function call — may be a network hop. The framework decides.
+        const product = await ctx.call(&quot;products.get&quot;, { id: ctx.params.productId });
+        const order = { id: Date.now(), product, qty: ctx.params.qty, total: product.price * ctx.params.qty };
+        // Publish an event. Whoever cares subscribes.
+        await ctx.emit(&quot;order.created&quot;, order);
+        return order;
+      },
+    },
+  },
+};
+
+const Notifications = {
+  name: &quot;notifications&quot;,
+  events: {
+    &quot;order.created&quot;(ctx) {
+      this.logger.info(`Email sent: order ${ctx.params.id}, total ${ctx.params.total} (from ${ctx.nodeID})`);
+    },
+  },
+};
+
+module.exports = { Products, Orders, Notifications };
+</code></pre>
+<p>The <code>params</code> block is a validation schema (Moleculer ships with <a href="https://github.com/icebob/fastest-validator">fastest-validator</a>); an invalid call is rejected with a structured <code>ValidationError</code> before your handler runs.</p>
+<p>Now load all three into a single broker and run it. No message broker, no Docker, nothing listening on a port:</p>
+<pre><code class="language-js">// monolith.js — all three services in ONE process. No broker, no network, no Docker.
+const { ServiceBroker } = require(&quot;moleculer&quot;);
+const { Products, Orders, Notifications } = require(&quot;./services&quot;);
+
+const broker = new ServiceBroker({ logger: { type: &quot;Console&quot;, options: { level: &quot;info&quot; } } });
+
+broker.createService(Products);
+broker.createService(Orders);
+broker.createService(Notifications);
+
+broker.start()
+  .then(() =&gt; broker.call(&quot;orders.create&quot;, { productId: 7, qty: 3 }))
+  .then((order) =&gt; console.log(&quot;Order:&quot;, order))
+  .then(() =&gt; broker.stop());
+</code></pre>
+<pre><code>$ npm install moleculer
+$ node monolith.js
+INFO  dev-laptop-51203/NOTIFICATIONS: Email sent: order 1788453205755, total 126 (from dev-laptop-51203)
+Order: {
+  id: 1788453205755,
+  product: { id: 7, name: &#39;Product #7&#39;, price: 42, servedBy: &#39;dev-laptop-51203&#39; },
+  qty: 3,
+  total: 126
+}
+</code></pre>
+<p>This is a <strong>modular monolith</strong>: one deployable, but the modules only talk through the same contract they&#39;d use over a network. It is a perfectly good place to stay for a long time. Many Moleculer users never leave it.</p>
+<h2>Step 2: split into processes with one config line</h2>
+<p>To run the services in separate processes, add a transporter. We&#39;ll use NATS — a single ~20 MB binary with no dependencies, and the best default for most teams.</p>
+<pre><code>$ docker run -d -p 4222:4222 nats:2
+$ npm install nats
+</code></pre>
+<p>The node script takes the names of the services it should host from the command line:</p>
+<pre><code class="language-js">// node.js — start ONE process that hosts the services named on the command line.
+//   node node.js products
+//   node node.js orders notifications
+// Same service code as before. The only new thing is the transporter.
+const { ServiceBroker } = require(&quot;moleculer&quot;);
+const all = require(&quot;./services&quot;);
+
+const broker = new ServiceBroker({
+  nodeID: `${process.argv.slice(2).join(&quot;+&quot;)}-${process.pid}`,
+  transporter: process.env.TRANSPORTER || &quot;nats://localhost:4222&quot;,
+  logger: { type: &quot;Console&quot;, options: { level: &quot;info&quot; } },
+});
+
+for (const name of process.argv.slice(2)) {
+  const schema = Object.values(all).find((s) =&gt; s.name === name);
+  if (!schema) throw new Error(`Unknown service: ${name}`);
+  broker.createService(schema);
+}
+
+broker.start();
+</code></pre>
+<p>Start two of them in two terminals:</p>
+<pre><code>$ node node.js products
+$ node node.js orders notifications
+</code></pre>
+<p>And a client that has no services of its own — it just joins the cluster and calls in:</p>
+<pre><code class="language-js">// client.js — a broker with no services of its own; it just calls into the cluster.
+const { ServiceBroker } = require(&quot;moleculer&quot;);
+
+const broker = new ServiceBroker({
+  nodeID: &quot;client&quot;,
+  transporter: process.env.TRANSPORTER || &quot;nats://localhost:4222&quot;,
+  logger: false,
+});
+
+broker.start()
+  .then(() =&gt; broker.waitForServices([&quot;orders&quot;]))
+  .then(async () =&gt; {
+    for (let i = 1; i &lt;= 4; i++) {
+      const order = await broker.call(&quot;orders.create&quot;, { productId: i, qty: 2 });
+      console.log(`order ${order.id} → total ${order.total}, product served by ${order.product.servedBy}`);
+    }
+    // Built-in introspection: which nodes are online and what do they host?
+    const nodes = await broker.call(&quot;$node.list&quot;, { withServices: true });
+    for (const n of nodes) console.log(`node ${n.id}: ${n.services.map((s) =&gt; s.name).filter((s) =&gt; s !== &quot;$node&quot;).join(&quot;, &quot;)}`);
+  })
+  .then(() =&gt; broker.stop());
+</code></pre>
+<pre><code>$ node client.js
+order 1788453251083 → total 84, product served by products-3455407
+order 1788453251095 → total 84, product served by products-3455407
+order 1788453251104 → total 84, product served by products-3455407
+order 1788453251112 → total 84, product served by products-3455407
+node client:
+node orders+notifications-3455409: orders, notifications
+node products-3455407: products
+</code></pre>
+<p>Look at what just happened without any configuration:</p>
+<ul>
+<li>The <code>orders</code> process called <code>products.get</code> in a <strong>different process</strong>. Nobody told it where <code>products</code> lives.</li>
+<li>The <code>order.created</code> event crossed the network and reached <code>notifications</code> (check the second terminal — it logged the four emails).</li>
+<li>The client discovered the whole cluster via the built-in <code>$node</code> service — a <strong>service registry</strong> you get for free.</li>
+</ul>
+<p>That is service discovery. There is no Consul, no etcd, no DNS trick. When a node starts it announces itself over the transporter; every other broker updates its local registry; heartbeats detect when a node disappears. The registry lives <em>inside</em> each process, so a lookup is a hash-map read, not a network call.</p>
+<p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/01-nodejs-microservices-without-kubernetes/diagram-topology.png" alt="The demo topology: four processes, one NATS server, zero orchestration."></p>
+<h2>Step 3: scale a service by starting another copy</h2>
+<p>Open a third terminal and start a second <code>products</code> process. Then run the client again:</p>
+<pre><code>$ node node.js products      # second instance
+$ node client.js
+order 1788453267932 → total 84, product served by products-3455456
+order 1788453267948 → total 84, product served by products-3455458
+order 1788453267956 → total 84, product served by products-3455456
+order 1788453267965 → total 84, product served by products-3455458
+node orders+notifications-3455460: orders, notifications
+node products-3455456: products
+node products-3455458: products
+</code></pre>
+<p>Calls now alternate between the two instances. That&#39;s the default <strong>round-robin load balancing</strong>; you can switch to random, CPU-usage-based, latency-based or shard-by-key strategies with one option. Stop one of the <code>products</code> processes and traffic moves to the survivor: a graceful stop deregisters the node immediately, and a hard crash is caught by the heartbeat timeout (configurable; the <a href="https://moleculer.services/docs/0.15/balancing">balancing docs</a> cover the strategies and the <a href="https://moleculer.services/docs/0.15/fault-tolerance">fault-tolerance docs</a> the failover behaviour).</p>
+<p>Notice the shape of the &quot;deploy&quot;: starting a process. Scaling: starting another process. There is no Deployment manifest, no replica count to reconcile, no rollout to watch. If your team runs services with <code>systemd</code>, PM2 or Docker Compose, you already have everything the framework needs.</p>
+<h2>Resilience is a broker option, not a library</h2>
+<p>In the Kubernetes world, retries, timeouts and circuit breaking usually arrive with the service mesh. Without a mesh you&#39;d reach for <code>opossum</code>, <code>p-retry</code> and <code>AbortSignal.timeout</code> and glue them into every call site. Moleculer bakes them into the call path:</p>
+<pre><code class="language-js">// resilience.js — timeout, retry and circuit breaker are broker options, not extra libraries.
+const { ServiceBroker, Errors } = require(&quot;moleculer&quot;);
+
+const broker = new ServiceBroker({
+  logger: false,
+  requestTimeout: 500,                    // ms; a hanging call becomes a RequestTimeoutError
+  retryPolicy: { enabled: true, retries: 2, delay: 50, factor: 2 },
+  circuitBreaker: {
+    enabled: true,
+    threshold: 0.5,                       // open when &gt;50% of calls fail...
+    minRequestCount: 5,                   // ...after at least 5 calls
+    windowTime: 60,                       // seconds
+    halfOpenTime: 5_000,                  // ms until we probe again
+  },
+});
+
+let calls = 0;
+broker.createService({
+  name: &quot;payments&quot;,
+  actions: {
+    charge: {
+      retryPolicy: { enabled: false },     // retries make no sense for a non-idempotent charge
+      handler() {
+        calls++;
+        throw new Errors.MoleculerError(&quot;gateway down&quot;, 503); // 5xx errors count against the breaker
+      },
+    },
+    fallbackDemo: {
+      fallback: () =&gt; ({ cached: true }),  // return this instead of throwing
+      handler() { throw new Errors.MoleculerError(&quot;nope&quot;, 500); },
+    },
+  },
+});
+
+broker.start().then(async () =&gt; {
+  for (let i = 1; i &lt;= 8; i++) {
+    try { await broker.call(&quot;payments.charge&quot;, { amount: 10 }); }
+    catch (err) { console.log(`call ${i}: ${err.name} (${err.message})`); }
+  }
+  console.log(&quot;handler actually ran:&quot;, calls, &quot;times&quot;);
+  console.log(&quot;fallback:&quot;, await broker.call(&quot;payments.fallbackDemo&quot;));
+  await broker.stop();
+});
+</code></pre>
+<pre><code>$ node resilience.js
+call 1: MoleculerError (gateway down)
+call 2: MoleculerError (gateway down)
+call 3: MoleculerError (gateway down)
+call 4: MoleculerError (gateway down)
+call 5: MoleculerError (gateway down)
+call 6: ServiceNotAvailableError (Service &#39;payments.charge&#39; is not available.)
+call 7: ServiceNotAvailableError (Service &#39;payments.charge&#39; is not available.)
+call 8: ServiceNotAvailableError (Service &#39;payments.charge&#39; is not available.)
+handler actually ran: 5 times
+fallback: { cached: true }
+</code></pre>
+<p>After five failures the <strong>circuit breaker</strong> opened and the next calls failed fast without touching the handler — exactly what you want when a payment gateway is melting down. Retries and timeouts are configured globally and overridden per action (note <code>retryPolicy: { enabled: false }</code> on the non-idempotent <code>charge</code>). A <strong>bulkhead</strong> (per-action concurrency limit) is one more option. None of this needed a sidecar.</p>
+<h2>Putting an HTTP door on it</h2>
+<p>Services talk to each other over the transporter, but browsers speak HTTP. The <code>moleculer-web</code> package is an API gateway that is <em>itself a service</em> — it joins the cluster like any other node and maps routes to actions:</p>
+<pre><code class="language-js">// gateway.js — HTTP edge. It is just another node in the cluster; it owns no business logic.
+const { ServiceBroker } = require(&quot;moleculer&quot;);
+const ApiGateway = require(&quot;moleculer-web&quot;);
+
+const broker = new ServiceBroker({
+  nodeID: `gateway-${process.pid}`,
+  transporter: process.env.TRANSPORTER || &quot;nats://localhost:4222&quot;,
+  logger: { type: &quot;Console&quot;, options: { level: &quot;warn&quot; } },
+});
+
+broker.createService({
+  name: &quot;api&quot;,
+  mixins: [ApiGateway],
+  settings: {
+    port: process.env.PORT || 3000,
+    routes: [{
+      path: &quot;/api&quot;,
+      // Only expose what you list here; everything else stays internal to the cluster.
+      whitelist: [&quot;products.get&quot;, &quot;orders.create&quot;],
+      aliases: {
+        &quot;GET /products/:id&quot;: &quot;products.get&quot;,
+        &quot;POST /orders&quot;: &quot;orders.create&quot;,
+      },
+      bodyParsers: { json: true },
+    }],
+  },
+});
+
+broker.start().then(() =&gt; console.log(`Gateway listening on http://localhost:${process.env.PORT || 3000}/api`));
+</code></pre>
+<pre><code>$ npm install moleculer-web
+$ node gateway.js
+$ curl localhost:3000/api/products/7
+{&quot;id&quot;:7,&quot;name&quot;:&quot;Product #7&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3455667&quot;}
+
+$ curl -X POST localhost:3000/api/orders -H &#39;content-type: application/json&#39; -d &#39;{&quot;productId&quot;:7,&quot;qty&quot;:2}&#39;
+{&quot;id&quot;:1788453318747,&quot;product&quot;:{&quot;id&quot;:7,&quot;name&quot;:&quot;Product #7&quot;,&quot;price&quot;:42,&quot;servedBy&quot;:&quot;products-3455612&quot;},&quot;qty&quot;:2,&quot;total&quot;:84}
+
+$ curl -X POST localhost:3000/api/orders -H &#39;content-type: application/json&#39; -d &#39;{&quot;productId&quot;:&quot;x&quot;}&#39;
+{&quot;name&quot;:&quot;ValidationError&quot;,&quot;message&quot;:&quot;Parameters validation error!&quot;,&quot;code&quot;:422,&quot;type&quot;:&quot;VALIDATION_ERROR&quot;,&quot;data&quot;:[{&quot;type&quot;:&quot;number&quot;,&quot;message&quot;:&quot;The &#39;productId&#39; field must be a number.&quot;,&quot;field&quot;:&quot;productId&quot;,&quot;actual&quot;:&quot;x&quot;,&quot;nodeID&quot;:&quot;gateway-3455616&quot;,&quot;action&quot;:&quot;orders.create&quot;},{&quot;type&quot;:&quot;required&quot;,&quot;message&quot;:&quot;The &#39;qty&#39; field is required.&quot;,&quot;field&quot;:&quot;qty&quot;,&quot;nodeID&quot;:&quot;gateway-3455616&quot;,&quot;action&quot;:&quot;orders.create&quot;}]}
+</code></pre>
+<p>The gateway has no knowledge of where <code>products</code> runs. The validation error came from the schema on the service, propagated back through the transporter, and was turned into a 422 automatically. Run two gateways behind nginx or Caddy and you&#39;ve got a redundant edge.</p>
+<h2>Deploying without an orchestrator</h2>
+<p>Here is the entire production topology for a small team, as a Compose file. One VM (or one per service if you like), a NATS container, and your Node processes:</p>
+<pre><code class="language-yaml"># docker-compose.yml — the whole &quot;cluster&quot; on one VM. No orchestrator.
+services:
+  nats:
+    image: nats:2
+
+  products:
+    build: .
+    command: node node.js products
+    environment: { TRANSPORTER: nats://nats:4222 }
+    depends_on: [nats]
+    deploy: { replicas: 2 }          # two instances; the framework balances between them
+
+  orders:
+    build: .
+    command: node node.js orders notifications
+    environment: { TRANSPORTER: nats://nats:4222 }
+    depends_on: [nats]
+
+  gateway:
+    build: .
+    command: node gateway.js
+    environment: { TRANSPORTER: nats://nats:4222 }
+    ports: [&quot;3000:3000&quot;]
+    depends_on: [nats]
+</code></pre>
+<p><code>docker compose up -d</code> and you have a load-balanced, self-discovering, fault-tolerant service cluster. To spread it over several machines, point every <code>TRANSPORTER</code> at the same NATS host — NATS itself clusters trivially if you need it to be redundant. Metrics (Prometheus, StatsD, Datadog) and distributed tracing (Jaeger, Zipkin, OpenTelemetry) are broker options too, so observability doesn&#39;t need sidecars either.</p>
+<p>What you give up compared to Kubernetes, honestly:</p>
+<ul>
+<li><strong>Automatic rescheduling.</strong> If a VM dies, nothing restarts your containers elsewhere. You handle it with a second VM and a health check, or accept the risk.</li>
+<li><strong>Rolling deploys as a primitive.</strong> Compose replaces containers; for zero-downtime you rely on Moleculer&#39;s graceful shutdown (a stopping node deregisters first and, with request tracking enabled, waits for in-flight requests before exiting) plus at least two replicas.</li>
+<li><strong>Autoscaling.</strong> You scale by editing <code>replicas</code>. For most teams that&#39;s a feature.</li>
+<li><strong>Secrets, RBAC, network policy.</strong> You use your OS and cloud provider&#39;s tools instead.</li>
+</ul>
+<h2>When you <em>do</em> want Kubernetes</h2>
+<p>If you already run a cluster, keep it — Moleculer runs perfectly well inside pods. The two layers are complementary rather than competing: Kubernetes handles scheduling, restarts and rollouts; Moleculer handles discovery, balancing and resilience at the application level, which means you don&#39;t need a service mesh on top. The <a href="https://moleculer.services/docs/0.15/deploying">official Kubernetes guide</a> covers it.</p>
+<p>You should also reach for an orchestrator when you have a genuinely large fleet (dozens of services, hundreds of instances), strict multi-tenant isolation requirements, or a platform team whose job it is to run one.</p>
+<p>But if you are three developers with a product to ship, the honest answer to &quot;how do we do microservices in Node.js?&quot; is: one message broker, a framework that owns the distributed-systems layer, and processes you start with a command you already know. Start as a modular monolith, split when a boundary is real, scale by launching another copy. Get to Kubernetes when Kubernetes solves a problem you actually have.</p>
+<hr>
+<p><em>All the code above runs as shown against Moleculer 0.15 on Node.js 22. The full example project is at <a href="https://github.com/moleculerjs/moleculer-examples/tree/master/01-microservices-without-kubernetes">github.com/moleculerjs/moleculer-examples</a> — docs at <a href="https://moleculer.services">moleculer.services</a>.</em></p>
+
+</article>
+</body>
+</html>
