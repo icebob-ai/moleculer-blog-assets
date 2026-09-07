@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Moleculer vs gRPC vs tRPC: an RPC protocol is not a service layer</title>
 <meta name="description" content="The same service three ways, then the same four problems against each: a second instance, a dead one, a slow one, a new one. Plus how to combine them.">
+
 <style>
 body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
 pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
@@ -253,7 +254,7 @@ circuitBreaker: {
   call 3: served by products-3
   call 4: served by products-1
 </code></pre>
-<p>This is the difference in one screen. gRPC did nothing wrong; it was never told. The thing that would tell it — a DNS record that updates, an xDS control plane, Kubernetes — is the infrastructure Moleculer ships in the box. Whether you want that in the box or in the platform is a legitimate architectural choice, and the Kubernetes post is about exactly that; but it is a choice you have to make, and &quot;just use gRPC&quot; hides it.</p>
+<p>This is the difference in one screen. gRPC did nothing wrong; it was never told. The thing that would tell it — a DNS record that updates, an xDS control plane, Kubernetes — is the infrastructure Moleculer ships in the box. Whether you want that in the box or in the platform is a legitimate architectural choice, and the <a href="https://medium.com/@icebob/node-js-microservices-without-kubernetes-and-without-a-platform-team-1464a5c9fd0d">Kubernetes post</a> is about exactly that; but it is a choice you have to make, and &quot;just use gRPC&quot; hides it.</p>
 <h2>Type safety, honestly</h2>
 <p>This is where the comparison flips.</p>
 <p><strong>tRPC</strong> is the best-in-class answer. The client&#39;s <code>p.servedBy</code> above is typed because the client was created from <code>typeof appRouter</code>. Rename a field on the server and every caller fails to compile. Zero build step, zero schema, one language. If both ends are TypeScript and both ends are yours, nothing else comes close.</p>
@@ -367,7 +368,7 @@ module.exports = {
 <li><strong>Your frontend is TypeScript and calls your own backend</strong> — tRPC, no contest. If that backend is a cluster of services, put tRPC on the gateway node and let Moleculer do the rest, as above.</li>
 <li><strong>Services in different languages must call each other, or you need bidirectional streaming</strong> — gRPC for that boundary. Wrap it in a Moleculer service if the rest of your system is Node, so the boundary gets timeouts, retries and a breaker without every caller reimplementing them.</li>
 <li><strong>A fleet of Node.js services that need to find each other, balance, fail over and publish events — and you do not want to run a mesh to get it</strong> — that is what Moleculer is, and the RPC inside it is the least interesting part. Accept the weaker static typing, or fix it at the edges with tRPC.</li>
-<li><strong>Already on Kubernetes with a mesh doing discovery, LB and retries</strong> — gRPC is a natural fit and Moleculer&#39;s registry is redundant; you would use it for events, caching and the programming model, or not at all. (The Kubernetes post argues the other case.)</li>
+<li><strong>Already on Kubernetes with a mesh doing discovery, LB and retries</strong> — gRPC is a natural fit and Moleculer&#39;s registry is redundant; you would use it for events, caching and the programming model, or not at all. (The <a href="https://medium.com/@icebob/node-js-microservices-without-kubernetes-and-without-a-platform-team-1464a5c9fd0d">Kubernetes post</a> argues the other case.)</li>
 </ul>
 <p>The unhelpful framing is &quot;which RPC is fastest&quot;. Problem 3 above is what a real outage looks like, and the interesting question is how much of the answer to it your tool ships with versus how much you are about to write.</p>
 <hr>

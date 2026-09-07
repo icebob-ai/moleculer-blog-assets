@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Moleculer vs NestJS: which one, and when</title>
 <meta name="description" content="The same service written in both frameworks, what each one does when you add a second instance, and a decision list instead of a sales pitch.">
+<link rel="canonical" href="https://dev.to/icebob/moleculer-vs-nestjs-which-one-and-when-ngp">
 <style>
 body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
 pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
@@ -175,7 +176,7 @@ $ curl -s localhost:3000/products/abc
 $ curl -s localhost:3000/products/5
 {&quot;name&quot;:&quot;ServiceNotAvailableError&quot;,&quot;message&quot;:&quot;Service &#39;products.get&#39; is not available.&quot;,&quot;code&quot;:404,&quot;type&quot;:&quot;SERVICE_NOT_AVAILABLE&quot;,&quot;data&quot;:{&quot;action&quot;:&quot;products.get&quot;}}
 </code></pre>
-<p>Here the load balancing is done by Moleculer&#39;s registry (round-robin by default; you can switch to latency-based, CPU-based or sharded). When the service instances went away, the gateway <em>knew</em> — it has a live registry of every node and action in the cluster, updated by heartbeats — and returned a structured, typed error. Add <code>retryPolicy</code> and <code>circuitBreaker</code> to the broker options and you get retries and a breaker on every call with no code changes; the previous article shows both in action.</p>
+<p>Here the load balancing is done by Moleculer&#39;s registry (round-robin by default; you can switch to latency-based, CPU-based or sharded). When the service instances went away, the gateway <em>knew</em> — it has a live registry of every node and action in the cluster, updated by heartbeats — and returned a structured, typed error. Add <code>retryPolicy</code> and <code>circuitBreaker</code> to the broker options and you get retries and a breaker on every call with no code changes; the <a href="https://medium.com/@icebob/node-js-microservices-without-kubernetes-and-without-a-platform-team-1464a5c9fd0d">previous article</a> shows both in action.</p>
 <h2>What you would have to add to NestJS</h2>
 <p>If you build a multi-service system on <code>@nestjs/microservices</code>, here is what is <em>not</em> in the box and what people typically bolt on:</p>
 <ul>
@@ -217,7 +218,7 @@ $ curl -s localhost:3000/products/5
 <p>Pick <strong>Moleculer</strong> if:</p>
 <ul>
 <li>You are building a system of many services <em>now</em>, and you do not want to assemble discovery, balancing, retries, circuit breakers, caching and tracing from six separate packages.</li>
-<li>You do <strong>not</strong> have Kubernetes or a service mesh and don&#39;t want to run one — Moleculer gives you those properties on a VM with Docker Compose (see Node.js microservices without Kubernetes).</li>
+<li>You do <strong>not</strong> have Kubernetes or a service mesh and don&#39;t want to run one — Moleculer gives you those properties on a VM with Docker Compose (see <a href="https://medium.com/@icebob/node-js-microservices-without-kubernetes-and-without-a-platform-team-1464a5c9fd0d">Node.js microservices without Kubernetes</a>).</li>
 <li>Your architecture is event-driven — balanced and broadcast events across services, over NATS, Redis, Kafka or MQTT, are first-class.</li>
 <li>You want to start as a modular monolith and split into processes later <em>without changing service code</em>.</li>
 <li>Plain JavaScript is fine, or you&#39;re happy with Moleculer&#39;s level of TypeScript support.</li>
