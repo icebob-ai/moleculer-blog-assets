@@ -29,20 +29,146 @@ blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; co
 <p>Let&#39;s build the smallest realistic thing: a <code>products</code> service that runs as its own process, behind an HTTP gateway, with two instances for redundancy. Both versions use NATS. All of the code below runs as shown — Node 22, NestJS 12, Moleculer 0.15.</p>
 <h3>NestJS</h3>
 <p>The service is a controller with a message pattern, bootstrapped as a microservice. The <code>queue</code> option puts every instance in the same NATS queue group, which is what gives you load balancing.</p>
-<pre>// nest/products.service.ts — a NestJS "microservice": a NATS listener with message patterns.<br>import "reflect-metadata";<br>import { Controller, Module } from "@nestjs/common";<br>import { NestFactory } from "@nestjs/core";<br>import { MessagePattern, Payload, Transport, MicroserviceOptions } from "@nestjs/microservices";<br><br>@Controller()<br>class ProductsController {<br>&nbsp;&nbsp;@MessagePattern("products.get")<br>&nbsp;&nbsp;get(@Payload() data: { id: number }) {<br>&nbsp;&nbsp;&nbsp;&nbsp;return { id: data.id, name: `Product #${data.id}`, price: 42, servedBy: `products-${process.pid}` };<br>&nbsp;&nbsp;}<br>}<br><br>@Module({ controllers: [ProductsController] })<br>class ProductsModule {}<br><br>async function bootstrap() {<br>&nbsp;&nbsp;const app = await NestFactory.createMicroservice&lt;MicroserviceOptions&gt;(ProductsModule, {<br>&nbsp;&nbsp;&nbsp;&nbsp;transport: Transport.NATS,<br>&nbsp;&nbsp;&nbsp;&nbsp;options: { servers: ["nats://localhost:4222"], queue: "products" }, // queue group = load balancing<br>&nbsp;&nbsp;});<br>&nbsp;&nbsp;await app.listen();<br>&nbsp;&nbsp;console.log(`products microservice up (pid ${process.pid})`);<br>}<br>bootstrap();</pre>
+<pre>// nest/products.service.ts — a NestJS "microservice": a NATS listener with message patterns.
+import "reflect-metadata";
+import { Controller, Module } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { MessagePattern, Payload, Transport, MicroserviceOptions } from "@nestjs/microservices";
+
+@Controller()
+class ProductsController {
+  @MessagePattern("products.get")
+  get(@Payload() data: { id: number }) {
+    return { id: data.id, name: `Product #${data.id}`, price: 42, servedBy: `products-${process.pid}` };
+  }
+}
+
+@Module({ controllers: [ProductsController] })
+class ProductsModule {}
+
+async function bootstrap() {
+  const app = await NestFactory.createMicroservice&lt;MicroserviceOptions&gt;(ProductsModule, {
+    transport: Transport.NATS,
+    options: { servers: ["nats://localhost:4222"], queue: "products" }, // queue group = load balancing
+  });
+  await app.listen();
+  console.log(`products microservice up (pid ${process.pid})`);
+}
+bootstrap();</pre>
 <p>The gateway is an ordinary Nest HTTP app with a <code>ClientProxy</code> injected. Note the two things you have to do yourself: convert the URL parameter with a pipe, and put a timeout on the call with RxJS.</p>
-<pre>// nest/gateway.ts — a NestJS HTTP app that calls the products microservice over NATS.<br>import "reflect-metadata";<br>import { Controller, Get, Module, Param, ParseIntPipe } from "@nestjs/common";<br>import { NestFactory } from "@nestjs/core";<br>import { ClientsModule, ClientProxy, Transport } from "@nestjs/microservices";<br>import { Inject } from "@nestjs/common";<br>import { firstValueFrom, timeout } from "rxjs";<br><br>@Controller("products")<br>class ProductsGatewayController {<br>&nbsp;&nbsp;constructor(@Inject("PRODUCTS") private readonly client: ClientProxy) {}<br><br>&nbsp;&nbsp;@Get(":id")<br>&nbsp;&nbsp;get(@Param("id", ParseIntPipe) id: number) {<br>&nbsp;&nbsp;&nbsp;&nbsp;// send() returns an Observable; you add timeouts/retries yourself.<br>&nbsp;&nbsp;&nbsp;&nbsp;return firstValueFrom(this.client.send("products.get", { id }).pipe(timeout(2000)));<br>&nbsp;&nbsp;}<br>}<br><br>@Module({<br>&nbsp;&nbsp;imports: [<br>&nbsp;&nbsp;&nbsp;&nbsp;ClientsModule.register([<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{ name: "PRODUCTS", transport: Transport.NATS, options: { servers: ["nats://localhost:4222"] } },<br>&nbsp;&nbsp;&nbsp;&nbsp;]),<br>&nbsp;&nbsp;],<br>&nbsp;&nbsp;controllers: [ProductsGatewayController],<br>})<br>class GatewayModule {}<br><br>async function bootstrap() {<br>&nbsp;&nbsp;const app = await NestFactory.create(GatewayModule, { logger: ["error", "warn"] });<br>&nbsp;&nbsp;await app.listen(process.env.PORT || 3000);<br>&nbsp;&nbsp;console.log(`gateway on http://localhost:${process.env.PORT || 3000}`);<br>}<br>bootstrap();</pre>
+<pre>// nest/gateway.ts — a NestJS HTTP app that calls the products microservice over NATS.
+import "reflect-metadata";
+import { Controller, Get, Module, Param, ParseIntPipe } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { ClientsModule, ClientProxy, Transport } from "@nestjs/microservices";
+import { Inject } from "@nestjs/common";
+import { firstValueFrom, timeout } from "rxjs";
+
+@Controller("products")
+class ProductsGatewayController {
+  constructor(@Inject("PRODUCTS") private readonly client: ClientProxy) {}
+
+  @Get(":id")
+  get(@Param("id", ParseIntPipe) id: number) {
+    // send() returns an Observable; you add timeouts/retries yourself.
+    return firstValueFrom(this.client.send("products.get", { id }).pipe(timeout(2000)));
+  }
+}
+
+@Module({
+  imports: [
+    ClientsModule.register([
+      { name: "PRODUCTS", transport: Transport.NATS, options: { servers: ["nats://localhost:4222"] } },
+    ]),
+  ],
+  controllers: [ProductsGatewayController],
+})
+class GatewayModule {}
+
+async function bootstrap() {
+  const app = await NestFactory.create(GatewayModule, { logger: ["error", "warn"] });
+  await app.listen(process.env.PORT || 3000);
+  console.log(`gateway on http://localhost:${process.env.PORT || 3000}`);
+}
+bootstrap();</pre>
 <p>Run two service instances and the gateway, then hit it:</p>
-<pre>$ npx tsx nest/products.service.ts &amp;<br>$ npx tsx nest/products.service.ts &amp;<br>$ npx tsx nest/gateway.ts &amp;<br>$ for i in 1 2 3 4; do curl -s localhost:3000/products/$i; echo; done<br>{"id":1,"name":"Product #1","price":42,"servedBy":"products-3460437"}<br>{"id":2,"name":"Product #2","price":42,"servedBy":"products-3460417"}<br>{"id":3,"name":"Product #3","price":42,"servedBy":"products-3460437"}<br>{"id":4,"name":"Product #4","price":42,"servedBy":"products-3460437"}<br><br>$ curl -s localhost:3000/products/abc<br>{"message":"Validation failed (numeric string is expected)","error":"Bad Request","statusCode":400}</pre>
+<pre>$ npx tsx nest/products.service.ts &amp;
+$ npx tsx nest/products.service.ts &amp;
+$ npx tsx nest/gateway.ts &amp;
+$ for i in 1 2 3 4; do curl -s localhost:3000/products/$i; echo; done
+{"id":1,"name":"Product #1","price":42,"servedBy":"products-3460437"}
+{"id":2,"name":"Product #2","price":42,"servedBy":"products-3460417"}
+{"id":3,"name":"Product #3","price":42,"servedBy":"products-3460437"}
+{"id":4,"name":"Product #4","price":42,"servedBy":"products-3460437"}
+
+$ curl -s localhost:3000/products/abc
+{"message":"Validation failed (numeric string is expected)","error":"Bad Request","statusCode":400}</pre>
 <p>Load balancing works (NATS is doing it, not Nest — the queue group hands each message to one subscriber). Validation works because we added <code>ParseIntPipe</code>. Now stop both <code>products</code> processes and call again:</p>
-<pre>$ curl -s localhost:3000/products/5<br>{"statusCode":500,"message":"Internal server error"}<br># gateway log: EmptyResponseException: Empty response. There are no subscribers listening to that message ("products.get")</pre>
+<pre>$ curl -s localhost:3000/products/5
+{"statusCode":500,"message":"Internal server error"}
+# gateway log: EmptyResponseException: Empty response. There are no subscribers listening to that message ("products.get")</pre>
 <p>Fast failure, which is good — NATS reports &quot;no responders&quot;. But it is a generic 500, there is no retry, no circuit breaker, and nothing in the gateway knows that <code>products</code> exists at all except the string <code>&quot;products.get&quot;</code>.</p>
 <h3>Moleculer</h3>
 <p>The same service as a Moleculer service schema. Validation is declared on the action; <code>convert: true</code> handles the string-from-URL case.</p>
-<pre>// moleculer/products.service.js — the same service in Moleculer.<br>const { ServiceBroker } = require("moleculer");<br><br>const broker = new ServiceBroker({<br>&nbsp;&nbsp;nodeID: `products-${process.pid}`,<br>&nbsp;&nbsp;transporter: "nats://localhost:4222",<br>&nbsp;&nbsp;logger: false,<br>});<br><br>broker.createService({<br>&nbsp;&nbsp;name: "products",<br>&nbsp;&nbsp;actions: {<br>&nbsp;&nbsp;&nbsp;&nbsp;get: {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;params: { id: { type: "number", convert: true } },   // validation is part of the action<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;handler(ctx) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return { id: ctx.params.id, name: `Product #${ctx.params.id}`, price: 42, servedBy: this.broker.nodeID };<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;},<br>});<br><br>broker.start().then(() =&gt; console.log(`products service up (${broker.nodeID})`));</pre>
+<pre>// moleculer/products.service.js — the same service in Moleculer.
+const { ServiceBroker } = require("moleculer");
+
+const broker = new ServiceBroker({
+  nodeID: `products-${process.pid}`,
+  transporter: "nats://localhost:4222",
+  logger: false,
+});
+
+broker.createService({
+  name: "products",
+  actions: {
+    get: {
+      params: { id: { type: "number", convert: true } },   // validation is part of the action
+      handler(ctx) {
+        return { id: ctx.params.id, name: `Product #${ctx.params.id}`, price: 42, servedBy: this.broker.nodeID };
+      },
+    },
+  },
+});
+
+broker.start().then(() =&gt; console.log(`products service up (${broker.nodeID})`));</pre>
 <p>The gateway uses <code>moleculer-web</code>, which is a service that maps HTTP routes to actions. The timeout is a broker option, so it applies to every call in the process.</p>
-<pre>// moleculer/gateway.js — HTTP edge, mapping a route to the action.<br>const { ServiceBroker } = require("moleculer");<br>const ApiGateway = require("moleculer-web");<br><br>const broker = new ServiceBroker({<br>&nbsp;&nbsp;nodeID: `gateway-${process.pid}`,<br>&nbsp;&nbsp;transporter: "nats://localhost:4222",<br>&nbsp;&nbsp;logger: false,<br>&nbsp;&nbsp;requestTimeout: 2000,                       // global; NestJS needs rxjs timeout() per call<br>});<br><br>broker.createService({<br>&nbsp;&nbsp;name: "api",<br>&nbsp;&nbsp;mixins: [ApiGateway],<br>&nbsp;&nbsp;settings: {<br>&nbsp;&nbsp;&nbsp;&nbsp;port: process.env.PORT || 3000,<br>&nbsp;&nbsp;&nbsp;&nbsp;routes: [{ path: "/", aliases: { "GET /products/:id": "products.get" } }],<br>&nbsp;&nbsp;},<br>});<br><br>broker.start().then(() =&gt; console.log(`gateway on http://localhost:${process.env.PORT || 3000}`));</pre>
-<pre>$ node moleculer/products.service.js &amp;<br>$ node moleculer/products.service.js &amp;<br>$ node moleculer/gateway.js &amp;<br>$ for i in 1 2 3 4; do curl -s localhost:3000/products/$i; echo; done<br>{"id":1,"name":"Product #1","price":42,"servedBy":"products-3460597"}<br>{"id":2,"name":"Product #2","price":42,"servedBy":"products-3460596"}<br>{"id":3,"name":"Product #3","price":42,"servedBy":"products-3460597"}<br>{"id":4,"name":"Product #4","price":42,"servedBy":"products-3460596"}<br><br>$ curl -s localhost:3000/products/abc<br>{"name":"ValidationError","message":"Parameters validation error!","code":422,"type":"VALIDATION_ERROR","data":[{"type":"number","message":"The 'id' field must be a number.","field":"id","actual":"abc","nodeID":"gateway-3460598","action":"products.get"}]}<br><br># stop both products processes, then:<br>$ curl -s localhost:3000/products/5<br>{"name":"ServiceNotAvailableError","message":"Service 'products.get' is not available.","code":404,"type":"SERVICE_NOT_AVAILABLE","data":{"action":"products.get"}}</pre>
+<pre>// moleculer/gateway.js — HTTP edge, mapping a route to the action.
+const { ServiceBroker } = require("moleculer");
+const ApiGateway = require("moleculer-web");
+
+const broker = new ServiceBroker({
+  nodeID: `gateway-${process.pid}`,
+  transporter: "nats://localhost:4222",
+  logger: false,
+  requestTimeout: 2000,                       // global; NestJS needs rxjs timeout() per call
+});
+
+broker.createService({
+  name: "api",
+  mixins: [ApiGateway],
+  settings: {
+    port: process.env.PORT || 3000,
+    routes: [{ path: "/", aliases: { "GET /products/:id": "products.get" } }],
+  },
+});
+
+broker.start().then(() =&gt; console.log(`gateway on http://localhost:${process.env.PORT || 3000}`));</pre>
+<pre>$ node moleculer/products.service.js &amp;
+$ node moleculer/products.service.js &amp;
+$ node moleculer/gateway.js &amp;
+$ for i in 1 2 3 4; do curl -s localhost:3000/products/$i; echo; done
+{"id":1,"name":"Product #1","price":42,"servedBy":"products-3460597"}
+{"id":2,"name":"Product #2","price":42,"servedBy":"products-3460596"}
+{"id":3,"name":"Product #3","price":42,"servedBy":"products-3460597"}
+{"id":4,"name":"Product #4","price":42,"servedBy":"products-3460596"}
+
+$ curl -s localhost:3000/products/abc
+{"name":"ValidationError","message":"Parameters validation error!","code":422,"type":"VALIDATION_ERROR","data":[{"type":"number","message":"The 'id' field must be a number.","field":"id","actual":"abc","nodeID":"gateway-3460598","action":"products.get"}]}
+
+# stop both products processes, then:
+$ curl -s localhost:3000/products/5
+{"name":"ServiceNotAvailableError","message":"Service 'products.get' is not available.","code":404,"type":"SERVICE_NOT_AVAILABLE","data":{"action":"products.get"}}</pre>
 <p>Here the load balancing is done by Moleculer&#39;s registry (round-robin by default; you can switch to latency-based, CPU-based or sharded). When the service instances went away, the gateway <em>knew</em> — it has a live registry of every node and action in the cluster, updated by heartbeats — and returned a structured, typed error. Add <code>retryPolicy</code> and <code>circuitBreaker</code> to the broker options and you get retries and a breaker on every call with no code changes; the <a href="https://medium.com/@icebob/node-js-microservices-without-kubernetes-and-without-a-platform-team-1464a5c9fd0d">previous article</a> shows both in action.</p>
 <h2>What you would have to add to NestJS</h2>
 <p>If you build a multi-service system on <code>@nestjs/microservices</code>, here is what is <em>not</em> in the box and what people typically bolt on:</p>

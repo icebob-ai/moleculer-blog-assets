@@ -44,22 +44,131 @@ blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; co
 <p>The crucial property: a service&#39;s code does not know whether the service it&#39;s calling is in the same process or on another machine. <code>ctx.call(&quot;products.get&quot;)</code> is the same line either way.</p>
 <h2>Step 1: three services, one process</h2>
 <p>Let&#39;s write a tiny shop: <code>products</code>, <code>orders</code> and <code>notifications</code>. Here is the business logic, and note that this file <strong>never changes</strong> for the rest of the article.</p>
-<pre>// services.js — the business logic. It never changes between "one process" and "many processes".<br><br>const Products = {<br>&nbsp;&nbsp;name: "products",<br>&nbsp;&nbsp;actions: {<br>&nbsp;&nbsp;&nbsp;&nbsp;get: {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;params: { id: { type: "number", convert: true } }, // convert: URL params arrive as strings<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;handler(ctx) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return { id: ctx.params.id, name: `Product #${ctx.params.id}`, price: 42, servedBy: this.broker.nodeID };<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;},<br>};<br><br>const Orders = {<br>&nbsp;&nbsp;name: "orders",<br>&nbsp;&nbsp;actions: {<br>&nbsp;&nbsp;&nbsp;&nbsp;create: {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;params: { productId: "number", qty: "number" },<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;async handler(ctx) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Looks like a local function call — may be a network hop. The framework decides.<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;const product = await ctx.call("products.get", { id: ctx.params.productId });<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;const order = { id: Date.now(), product, qty: ctx.params.qty, total: product.price * ctx.params.qty };<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Publish an event. Whoever cares subscribes.<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;await ctx.emit("order.created", order);<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return order;<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;},<br>};<br><br>const Notifications = {<br>&nbsp;&nbsp;name: "notifications",<br>&nbsp;&nbsp;events: {<br>&nbsp;&nbsp;&nbsp;&nbsp;"order.created"(ctx) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;this.logger.info(`Email sent: order ${ctx.params.id}, total ${ctx.params.total} (from ${ctx.nodeID})`);<br>&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;},<br>};<br><br>module.exports = { Products, Orders, Notifications };</pre>
+<pre>// services.js — the business logic. It never changes between "one process" and "many processes".
+
+const Products = {
+  name: "products",
+  actions: {
+    get: {
+      params: { id: { type: "number", convert: true } }, // convert: URL params arrive as strings
+      handler(ctx) {
+        return { id: ctx.params.id, name: `Product #${ctx.params.id}`, price: 42, servedBy: this.broker.nodeID };
+      },
+    },
+  },
+};
+
+const Orders = {
+  name: "orders",
+  actions: {
+    create: {
+      params: { productId: "number", qty: "number" },
+      async handler(ctx) {
+        // Looks like a local function call — may be a network hop. The framework decides.
+        const product = await ctx.call("products.get", { id: ctx.params.productId });
+        const order = { id: Date.now(), product, qty: ctx.params.qty, total: product.price * ctx.params.qty };
+        // Publish an event. Whoever cares subscribes.
+        await ctx.emit("order.created", order);
+        return order;
+      },
+    },
+  },
+};
+
+const Notifications = {
+  name: "notifications",
+  events: {
+    "order.created"(ctx) {
+      this.logger.info(`Email sent: order ${ctx.params.id}, total ${ctx.params.total} (from ${ctx.nodeID})`);
+    },
+  },
+};
+
+module.exports = { Products, Orders, Notifications };</pre>
 <p>The <code>params</code> block is a validation schema (Moleculer ships with <a href="https://github.com/icebob/fastest-validator">fastest-validator</a>); an invalid call is rejected with a structured <code>ValidationError</code> before your handler runs.</p>
 <p>Now load all three into a single broker and run it. No message broker, no Docker, nothing listening on a port:</p>
-<pre>// monolith.js — all three services in ONE process. No broker, no network, no Docker.<br>const { ServiceBroker } = require("moleculer");<br>const { Products, Orders, Notifications } = require("./services");<br><br>const broker = new ServiceBroker({ logger: { type: "Console", options: { level: "info" } } });<br><br>broker.createService(Products);<br>broker.createService(Orders);<br>broker.createService(Notifications);<br><br>broker.start()<br>&nbsp;&nbsp;.then(() =&gt; broker.call("orders.create", { productId: 7, qty: 3 }))<br>&nbsp;&nbsp;.then((order) =&gt; console.log("Order:", order))<br>&nbsp;&nbsp;.then(() =&gt; broker.stop());</pre>
-<pre>$ npm install moleculer<br>$ node monolith.js<br>INFO  dev-laptop-51203/NOTIFICATIONS: Email sent: order 1788453205755, total 126 (from dev-laptop-51203)<br>Order: {<br>&nbsp;&nbsp;id: 1788453205755,<br>&nbsp;&nbsp;product: { id: 7, name: 'Product #7', price: 42, servedBy: 'dev-laptop-51203' },<br>&nbsp;&nbsp;qty: 3,<br>&nbsp;&nbsp;total: 126<br>}</pre>
+<pre>// monolith.js — all three services in ONE process. No broker, no network, no Docker.
+const { ServiceBroker } = require("moleculer");
+const { Products, Orders, Notifications } = require("./services");
+
+const broker = new ServiceBroker({ logger: { type: "Console", options: { level: "info" } } });
+
+broker.createService(Products);
+broker.createService(Orders);
+broker.createService(Notifications);
+
+broker.start()
+  .then(() =&gt; broker.call("orders.create", { productId: 7, qty: 3 }))
+  .then((order) =&gt; console.log("Order:", order))
+  .then(() =&gt; broker.stop());</pre>
+<pre>$ npm install moleculer
+$ node monolith.js
+INFO  dev-laptop-51203/NOTIFICATIONS: Email sent: order 1788453205755, total 126 (from dev-laptop-51203)
+Order: {
+  id: 1788453205755,
+  product: { id: 7, name: 'Product #7', price: 42, servedBy: 'dev-laptop-51203' },
+  qty: 3,
+  total: 126
+}</pre>
 <p>This is a <strong>modular monolith</strong>: one deployable, but the modules only talk through the same contract they&#39;d use over a network. It is a perfectly good place to stay for a long time. Many Moleculer users never leave it.</p>
 <h2>Step 2: split into processes with one config line</h2>
 <p>To run the services in separate processes, add a transporter. We&#39;ll use NATS — a single ~20 MB binary with no dependencies, and the best default for most teams.</p>
-<pre>$ docker run -d -p 4222:4222 nats:2<br>$ npm install nats</pre>
+<pre>$ docker run -d -p 4222:4222 nats:2
+$ npm install nats</pre>
 <p>The node script takes the names of the services it should host from the command line:</p>
-<pre>// node.js — start ONE process that hosts the services named on the command line.<br>//   node node.js products<br>//   node node.js orders notifications<br>// Same service code as before. The only new thing is the transporter.<br>const { ServiceBroker } = require("moleculer");<br>const all = require("./services");<br><br>const broker = new ServiceBroker({<br>&nbsp;&nbsp;nodeID: `${process.argv.slice(2).join("+")}-${process.pid}`,<br>&nbsp;&nbsp;transporter: process.env.TRANSPORTER || "nats://localhost:4222",<br>&nbsp;&nbsp;logger: { type: "Console", options: { level: "info" } },<br>});<br><br>for (const name of process.argv.slice(2)) {<br>&nbsp;&nbsp;const schema = Object.values(all).find((s) =&gt; s.name === name);<br>&nbsp;&nbsp;if (!schema) throw new Error(`Unknown service: ${name}`);<br>&nbsp;&nbsp;broker.createService(schema);<br>}<br><br>broker.start();</pre>
+<pre>// node.js — start ONE process that hosts the services named on the command line.
+//   node node.js products
+//   node node.js orders notifications
+// Same service code as before. The only new thing is the transporter.
+const { ServiceBroker } = require("moleculer");
+const all = require("./services");
+
+const broker = new ServiceBroker({
+  nodeID: `${process.argv.slice(2).join("+")}-${process.pid}`,
+  transporter: process.env.TRANSPORTER || "nats://localhost:4222",
+  logger: { type: "Console", options: { level: "info" } },
+});
+
+for (const name of process.argv.slice(2)) {
+  const schema = Object.values(all).find((s) =&gt; s.name === name);
+  if (!schema) throw new Error(`Unknown service: ${name}`);
+  broker.createService(schema);
+}
+
+broker.start();</pre>
 <p>Start two of them in two terminals:</p>
-<pre>$ node node.js products<br>$ node node.js orders notifications</pre>
+<pre>$ node node.js products
+$ node node.js orders notifications</pre>
 <p>And a client that has no services of its own — it just joins the cluster and calls in:</p>
-<pre>// client.js — a broker with no services of its own; it just calls into the cluster.<br>const { ServiceBroker } = require("moleculer");<br><br>const broker = new ServiceBroker({<br>&nbsp;&nbsp;nodeID: "client",<br>&nbsp;&nbsp;transporter: process.env.TRANSPORTER || "nats://localhost:4222",<br>&nbsp;&nbsp;logger: false,<br>});<br><br>broker.start()<br>&nbsp;&nbsp;.then(() =&gt; broker.waitForServices(["orders"]))<br>&nbsp;&nbsp;.then(async () =&gt; {<br>&nbsp;&nbsp;&nbsp;&nbsp;for (let i = 1; i &lt;= 4; i++) {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;const order = await broker.call("orders.create", { productId: i, qty: 2 });<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;console.log(`order ${order.id} → total ${order.total}, product served by ${order.product.servedBy}`);<br>&nbsp;&nbsp;&nbsp;&nbsp;}<br>&nbsp;&nbsp;&nbsp;&nbsp;// Built-in introspection: which nodes are online and what do they host?<br>&nbsp;&nbsp;&nbsp;&nbsp;const nodes = await broker.call("$node.list", { withServices: true });<br>&nbsp;&nbsp;&nbsp;&nbsp;for (const n of nodes) console.log(`node ${n.id}: ${n.services.map((s) =&gt; s.name).filter((s) =&gt; s !== "$node").join(", ")}`);<br>&nbsp;&nbsp;})<br>&nbsp;&nbsp;.then(() =&gt; broker.stop());</pre>
-<pre>$ node client.js<br>order 1788453251083 → total 84, product served by products-3455407<br>order 1788453251095 → total 84, product served by products-3455407<br>order 1788453251104 → total 84, product served by products-3455407<br>order 1788453251112 → total 84, product served by products-3455407<br>node client:<br>node orders+notifications-3455409: orders, notifications<br>node products-3455407: products</pre>
+<pre>// client.js — a broker with no services of its own; it just calls into the cluster.
+const { ServiceBroker } = require("moleculer");
+
+const broker = new ServiceBroker({
+  nodeID: "client",
+  transporter: process.env.TRANSPORTER || "nats://localhost:4222",
+  logger: false,
+});
+
+broker.start()
+  .then(() =&gt; broker.waitForServices(["orders"]))
+  .then(async () =&gt; {
+    for (let i = 1; i &lt;= 4; i++) {
+      const order = await broker.call("orders.create", { productId: i, qty: 2 });
+      console.log(`order ${order.id} → total ${order.total}, product served by ${order.product.servedBy}`);
+    }
+    // Built-in introspection: which nodes are online and what do they host?
+    const nodes = await broker.call("$node.list", { withServices: true });
+    for (const n of nodes) console.log(`node ${n.id}: ${n.services.map((s) =&gt; s.name).filter((s) =&gt; s !== "$node").join(", ")}`);
+  })
+  .then(() =&gt; broker.stop());</pre>
+<pre>$ node client.js
+order 1788453251083 → total 84, product served by products-3455407
+order 1788453251095 → total 84, product served by products-3455407
+order 1788453251104 → total 84, product served by products-3455407
+order 1788453251112 → total 84, product served by products-3455407
+node client:
+node orders+notifications-3455409: orders, notifications
+node products-3455407: products</pre>
 <p>Look at what just happened without any configuration:</p>
 <ul>
 <li>The <code>orders</code> process called <code>products.get</code> in a <strong>different process</strong>. Nobody told it where <code>products</code> lives.</li>
@@ -70,22 +179,142 @@ blockquote { border-left: 3px solid #ddd; margin-left: 0; padding-left: 1rem; co
 <p><img src="https://raw.githubusercontent.com/icebob-ai/moleculer-blog-assets/main/posts/01-nodejs-microservices-without-kubernetes/diagram-topology.png" alt="The demo topology: four processes, one NATS server, zero orchestration."></p>
 <h2>Step 3: scale a service by starting another copy</h2>
 <p>Open a third terminal and start a second <code>products</code> process. Then run the client again:</p>
-<pre>$ node node.js products      # second instance<br>$ node client.js<br>order 1788453267932 → total 84, product served by products-3455456<br>order 1788453267948 → total 84, product served by products-3455458<br>order 1788453267956 → total 84, product served by products-3455456<br>order 1788453267965 → total 84, product served by products-3455458<br>node orders+notifications-3455460: orders, notifications<br>node products-3455456: products<br>node products-3455458: products</pre>
+<pre>$ node node.js products      # second instance
+$ node client.js
+order 1788453267932 → total 84, product served by products-3455456
+order 1788453267948 → total 84, product served by products-3455458
+order 1788453267956 → total 84, product served by products-3455456
+order 1788453267965 → total 84, product served by products-3455458
+node orders+notifications-3455460: orders, notifications
+node products-3455456: products
+node products-3455458: products</pre>
 <p>Calls now alternate between the two instances. That&#39;s the default <strong>round-robin load balancing</strong>; you can switch to random, CPU-usage-based, latency-based or shard-by-key strategies with one option. Stop one of the <code>products</code> processes and traffic moves to the survivor: a graceful stop deregisters the node immediately, and a hard crash is caught by the heartbeat timeout (configurable; the <a href="https://moleculer.services/docs/0.15/balancing">balancing docs</a> cover the strategies and the <a href="https://moleculer.services/docs/0.15/fault-tolerance">fault-tolerance docs</a> the failover behaviour).</p>
 <p>Notice the shape of the &quot;deploy&quot;: starting a process. Scaling: starting another process. There is no Deployment manifest, no replica count to reconcile, no rollout to watch. If your team runs services with <code>systemd</code>, PM2 or Docker Compose, you already have everything the framework needs.</p>
 <h2>Resilience is a broker option, not a library</h2>
 <p>In the Kubernetes world, retries, timeouts and circuit breaking usually arrive with the service mesh. Without a mesh you&#39;d reach for <code>opossum</code>, <code>p-retry</code> and <code>AbortSignal.timeout</code> and glue them into every call site. Moleculer bakes them into the call path:</p>
-<pre>// resilience.js — timeout, retry and circuit breaker are broker options, not extra libraries.<br>const { ServiceBroker, Errors } = require("moleculer");<br><br>const broker = new ServiceBroker({<br>&nbsp;&nbsp;logger: false,<br>&nbsp;&nbsp;requestTimeout: 500,                    // ms; a hanging call becomes a RequestTimeoutError<br>&nbsp;&nbsp;retryPolicy: { enabled: true, retries: 2, delay: 50, factor: 2 },<br>&nbsp;&nbsp;circuitBreaker: {<br>&nbsp;&nbsp;&nbsp;&nbsp;enabled: true,<br>&nbsp;&nbsp;&nbsp;&nbsp;threshold: 0.5,                       // open when &gt;50% of calls fail...<br>&nbsp;&nbsp;&nbsp;&nbsp;minRequestCount: 5,                   // ...after at least 5 calls<br>&nbsp;&nbsp;&nbsp;&nbsp;windowTime: 60,                       // seconds<br>&nbsp;&nbsp;&nbsp;&nbsp;halfOpenTime: 5_000,                  // ms until we probe again<br>&nbsp;&nbsp;},<br>});<br><br>let calls = 0;<br>broker.createService({<br>&nbsp;&nbsp;name: "payments",<br>&nbsp;&nbsp;actions: {<br>&nbsp;&nbsp;&nbsp;&nbsp;charge: {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;retryPolicy: { enabled: false },     // retries make no sense for a non-idempotent charge<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;handler() {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;calls++;<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;throw new Errors.MoleculerError("gateway down", 503); // 5xx errors count against the breaker<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;&nbsp;&nbsp;fallbackDemo: {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;fallback: () =&gt; ({ cached: true }),  // return this instead of throwing<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;handler() { throw new Errors.MoleculerError("nope", 500); },<br>&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;},<br>});<br><br>broker.start().then(async () =&gt; {<br>&nbsp;&nbsp;for (let i = 1; i &lt;= 8; i++) {<br>&nbsp;&nbsp;&nbsp;&nbsp;try { await broker.call("payments.charge", { amount: 10 }); }<br>&nbsp;&nbsp;&nbsp;&nbsp;catch (err) { console.log(`call ${i}: ${err.name} (${err.message})`); }<br>&nbsp;&nbsp;}<br>&nbsp;&nbsp;console.log("handler actually ran:", calls, "times");<br>&nbsp;&nbsp;console.log("fallback:", await broker.call("payments.fallbackDemo"));<br>&nbsp;&nbsp;await broker.stop();<br>});</pre>
-<pre>$ node resilience.js<br>call 1: MoleculerError (gateway down)<br>call 2: MoleculerError (gateway down)<br>call 3: MoleculerError (gateway down)<br>call 4: MoleculerError (gateway down)<br>call 5: MoleculerError (gateway down)<br>call 6: ServiceNotAvailableError (Service 'payments.charge' is not available.)<br>call 7: ServiceNotAvailableError (Service 'payments.charge' is not available.)<br>call 8: ServiceNotAvailableError (Service 'payments.charge' is not available.)<br>handler actually ran: 5 times<br>fallback: { cached: true }</pre>
+<pre>// resilience.js — timeout, retry and circuit breaker are broker options, not extra libraries.
+const { ServiceBroker, Errors } = require("moleculer");
+
+const broker = new ServiceBroker({
+  logger: false,
+  requestTimeout: 500,                    // ms; a hanging call becomes a RequestTimeoutError
+  retryPolicy: { enabled: true, retries: 2, delay: 50, factor: 2 },
+  circuitBreaker: {
+    enabled: true,
+    threshold: 0.5,                       // open when &gt;50% of calls fail...
+    minRequestCount: 5,                   // ...after at least 5 calls
+    windowTime: 60,                       // seconds
+    halfOpenTime: 5_000,                  // ms until we probe again
+  },
+});
+
+let calls = 0;
+broker.createService({
+  name: "payments",
+  actions: {
+    charge: {
+      retryPolicy: { enabled: false },     // retries make no sense for a non-idempotent charge
+      handler() {
+        calls++;
+        throw new Errors.MoleculerError("gateway down", 503); // 5xx errors count against the breaker
+      },
+    },
+    fallbackDemo: {
+      fallback: () =&gt; ({ cached: true }),  // return this instead of throwing
+      handler() { throw new Errors.MoleculerError("nope", 500); },
+    },
+  },
+});
+
+broker.start().then(async () =&gt; {
+  for (let i = 1; i &lt;= 8; i++) {
+    try { await broker.call("payments.charge", { amount: 10 }); }
+    catch (err) { console.log(`call ${i}: ${err.name} (${err.message})`); }
+  }
+  console.log("handler actually ran:", calls, "times");
+  console.log("fallback:", await broker.call("payments.fallbackDemo"));
+  await broker.stop();
+});</pre>
+<pre>$ node resilience.js
+call 1: MoleculerError (gateway down)
+call 2: MoleculerError (gateway down)
+call 3: MoleculerError (gateway down)
+call 4: MoleculerError (gateway down)
+call 5: MoleculerError (gateway down)
+call 6: ServiceNotAvailableError (Service 'payments.charge' is not available.)
+call 7: ServiceNotAvailableError (Service 'payments.charge' is not available.)
+call 8: ServiceNotAvailableError (Service 'payments.charge' is not available.)
+handler actually ran: 5 times
+fallback: { cached: true }</pre>
 <p>After five failures the <strong>circuit breaker</strong> opened and the next calls failed fast without touching the handler — exactly what you want when a payment gateway is melting down. Retries and timeouts are configured globally and overridden per action (note <code>retryPolicy: { enabled: false }</code> on the non-idempotent <code>charge</code>). A <strong>bulkhead</strong> (per-action concurrency limit) is one more option. None of this needed a sidecar.</p>
 <h2>Putting an HTTP door on it</h2>
 <p>Services talk to each other over the transporter, but browsers speak HTTP. The <code>moleculer-web</code> package is an API gateway that is <em>itself a service</em> — it joins the cluster like any other node and maps routes to actions:</p>
-<pre>// gateway.js — HTTP edge. It is just another node in the cluster; it owns no business logic.<br>const { ServiceBroker } = require("moleculer");<br>const ApiGateway = require("moleculer-web");<br><br>const broker = new ServiceBroker({<br>&nbsp;&nbsp;nodeID: `gateway-${process.pid}`,<br>&nbsp;&nbsp;transporter: process.env.TRANSPORTER || "nats://localhost:4222",<br>&nbsp;&nbsp;logger: { type: "Console", options: { level: "warn" } },<br>});<br><br>broker.createService({<br>&nbsp;&nbsp;name: "api",<br>&nbsp;&nbsp;mixins: [ApiGateway],<br>&nbsp;&nbsp;settings: {<br>&nbsp;&nbsp;&nbsp;&nbsp;port: process.env.PORT || 3000,<br>&nbsp;&nbsp;&nbsp;&nbsp;routes: [{<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;path: "/api",<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;// Only expose what you list here; everything else stays internal to the cluster.<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;whitelist: ["products.get", "orders.create"],<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;aliases: {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"GET /products/:id": "products.get",<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"POST /orders": "orders.create",<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;},<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;bodyParsers: { json: true },<br>&nbsp;&nbsp;&nbsp;&nbsp;}],<br>&nbsp;&nbsp;},<br>});<br><br>broker.start().then(() =&gt; console.log(`Gateway listening on http://localhost:${process.env.PORT || 3000}/api`));</pre>
-<pre>$ npm install moleculer-web<br>$ node gateway.js<br>$ curl localhost:3000/api/products/7<br>{"id":7,"name":"Product #7","price":42,"servedBy":"products-3455667"}<br><br>$ curl -X POST localhost:3000/api/orders -H 'content-type: application/json' -d '{"productId":7,"qty":2}'<br>{"id":1788453318747,"product":{"id":7,"name":"Product #7","price":42,"servedBy":"products-3455612"},"qty":2,"total":84}<br><br>$ curl -X POST localhost:3000/api/orders -H 'content-type: application/json' -d '{"productId":"x"}'<br>{"name":"ValidationError","message":"Parameters validation error!","code":422,"type":"VALIDATION_ERROR","data":[{"type":"number","message":"The 'productId' field must be a number.","field":"productId","actual":"x","nodeID":"gateway-3455616","action":"orders.create"},{"type":"required","message":"The 'qty' field is required.","field":"qty","nodeID":"gateway-3455616","action":"orders.create"}]}</pre>
+<pre>// gateway.js — HTTP edge. It is just another node in the cluster; it owns no business logic.
+const { ServiceBroker } = require("moleculer");
+const ApiGateway = require("moleculer-web");
+
+const broker = new ServiceBroker({
+  nodeID: `gateway-${process.pid}`,
+  transporter: process.env.TRANSPORTER || "nats://localhost:4222",
+  logger: { type: "Console", options: { level: "warn" } },
+});
+
+broker.createService({
+  name: "api",
+  mixins: [ApiGateway],
+  settings: {
+    port: process.env.PORT || 3000,
+    routes: [{
+      path: "/api",
+      // Only expose what you list here; everything else stays internal to the cluster.
+      whitelist: ["products.get", "orders.create"],
+      aliases: {
+        "GET /products/:id": "products.get",
+        "POST /orders": "orders.create",
+      },
+      bodyParsers: { json: true },
+    }],
+  },
+});
+
+broker.start().then(() =&gt; console.log(`Gateway listening on http://localhost:${process.env.PORT || 3000}/api`));</pre>
+<pre>$ npm install moleculer-web
+$ node gateway.js
+$ curl localhost:3000/api/products/7
+{"id":7,"name":"Product #7","price":42,"servedBy":"products-3455667"}
+
+$ curl -X POST localhost:3000/api/orders -H 'content-type: application/json' -d '{"productId":7,"qty":2}'
+{"id":1788453318747,"product":{"id":7,"name":"Product #7","price":42,"servedBy":"products-3455612"},"qty":2,"total":84}
+
+$ curl -X POST localhost:3000/api/orders -H 'content-type: application/json' -d '{"productId":"x"}'
+{"name":"ValidationError","message":"Parameters validation error!","code":422,"type":"VALIDATION_ERROR","data":[{"type":"number","message":"The 'productId' field must be a number.","field":"productId","actual":"x","nodeID":"gateway-3455616","action":"orders.create"},{"type":"required","message":"The 'qty' field is required.","field":"qty","nodeID":"gateway-3455616","action":"orders.create"}]}</pre>
 <p>The gateway has no knowledge of where <code>products</code> runs. The validation error came from the schema on the service, propagated back through the transporter, and was turned into a 422 automatically. Run two gateways behind nginx or Caddy and you&#39;ve got a redundant edge.</p>
 <h2>Deploying without an orchestrator</h2>
 <p>Here is the entire production topology for a small team, as a Compose file. One VM (or one per service if you like), a NATS container, and your Node processes:</p>
-<pre># docker-compose.yml — the whole "cluster" on one VM. No orchestrator.<br>services:<br>&nbsp;&nbsp;nats:<br>&nbsp;&nbsp;&nbsp;&nbsp;image: nats:2<br><br>&nbsp;&nbsp;products:<br>&nbsp;&nbsp;&nbsp;&nbsp;build: .<br>&nbsp;&nbsp;&nbsp;&nbsp;command: node node.js products<br>&nbsp;&nbsp;&nbsp;&nbsp;environment: { TRANSPORTER: nats://nats:4222 }<br>&nbsp;&nbsp;&nbsp;&nbsp;depends_on: [nats]<br>&nbsp;&nbsp;&nbsp;&nbsp;deploy: { replicas: 2 }          # two instances; the framework balances between them<br><br>&nbsp;&nbsp;orders:<br>&nbsp;&nbsp;&nbsp;&nbsp;build: .<br>&nbsp;&nbsp;&nbsp;&nbsp;command: node node.js orders notifications<br>&nbsp;&nbsp;&nbsp;&nbsp;environment: { TRANSPORTER: nats://nats:4222 }<br>&nbsp;&nbsp;&nbsp;&nbsp;depends_on: [nats]<br><br>&nbsp;&nbsp;gateway:<br>&nbsp;&nbsp;&nbsp;&nbsp;build: .<br>&nbsp;&nbsp;&nbsp;&nbsp;command: node gateway.js<br>&nbsp;&nbsp;&nbsp;&nbsp;environment: { TRANSPORTER: nats://nats:4222 }<br>&nbsp;&nbsp;&nbsp;&nbsp;ports: ["3000:3000"]<br>&nbsp;&nbsp;&nbsp;&nbsp;depends_on: [nats]</pre>
+<pre># docker-compose.yml — the whole "cluster" on one VM. No orchestrator.
+services:
+  nats:
+    image: nats:2
+
+  products:
+    build: .
+    command: node node.js products
+    environment: { TRANSPORTER: nats://nats:4222 }
+    depends_on: [nats]
+    deploy: { replicas: 2 }          # two instances; the framework balances between them
+
+  orders:
+    build: .
+    command: node node.js orders notifications
+    environment: { TRANSPORTER: nats://nats:4222 }
+    depends_on: [nats]
+
+  gateway:
+    build: .
+    command: node gateway.js
+    environment: { TRANSPORTER: nats://nats:4222 }
+    ports: ["3000:3000"]
+    depends_on: [nats]</pre>
 <p><code>docker compose up -d</code> and you have a load-balanced, self-discovering, fault-tolerant service cluster. To spread it over several machines, point every <code>TRANSPORTER</code> at the same NATS host — NATS itself clusters trivially if you need it to be redundant. Metrics (Prometheus, StatsD, Datadog) and distributed tracing (Jaeger, Zipkin, OpenTelemetry) are broker options too, so observability doesn&#39;t need sidecars either.</p>
 <p>What you give up compared to Kubernetes, honestly:</p>
 <ul>
