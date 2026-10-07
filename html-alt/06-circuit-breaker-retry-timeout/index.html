@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Circuit breaker, retry and timeout in Node.js microservices — and why you need all three</title>
 <meta name="description" content="A dependency that is almost working is the failure mode a monolith never had. Six live demos: retry, a per-endpoint breaker that heals, timeout budgets, fallback and bulkhead.">
-
+<link rel="canonical" href="https://dev.to/icebob/circuit-breaker-retry-and-timeout-in-nodejs-microservices-and-why-you-need-all-three-3jj7">
 <style>
 body { max-width: 46rem; margin: 2rem auto; padding: 0 1rem; font: 18px/1.6 Georgia, serif; color: #222; }
 pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
@@ -229,7 +229,7 @@ await ctx.call("inventory.check", { sku }, { retries: 5 });</pre>
 <ul>
 <li><strong>Fallback</strong> is the outermost layer — it only kicks in after everything else has given up.</li>
 <li><strong>Retry</strong> wraps <strong>Timeout</strong>, so <em>each attempt</em> gets the full timeout; a retried call can take <code>retries × timeout</code> in the worst case. Budget accordingly.</li>
-<li><strong>Timeout</strong> wraps the <strong>Circuit breaker</strong>, so a timed-out attempt is reported to the breaker as a failure of that endpoint.</li>
+<li><strong>Timeout</strong> wraps the <strong>Circuit breaker</strong>, so the caller&#39;s timeout fires <em>outside</em> the breaker. A slow endpoint is counted only when the callee&#39;s own timeout error (504) comes back through the breaker, and that happens only while retry keeps the request alive: with retries off, the caller drops the pending request first, the 504 arrives as an orphan response, and the breaker never sees it. Retry is on in this section, which is why the breaker opened above.</li>
 <li><strong>Bulkhead</strong> (section 6) is innermost and runs on the callee.</li>
 </ul>
 <p>The timeout can be set on three levels, most specific wins: per call (<code>{ timeout: 1000 }</code> in the options, as above), per action (<code>timeout: 1000</code> in the action schema — the callee saying &quot;I should never take longer than this&quot;), and per broker (<code>requestTimeout</code>). Set the broker-level one in every production config. A wrong value is better than <code>0</code>.</p>
